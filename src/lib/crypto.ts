@@ -110,7 +110,22 @@ export interface PhotoEnvelope {
   reply?: ReplyContext
 }
 
-export type Envelope = TextEnvelope | ReactionEnvelope | PhotoEnvelope
+/// Carbon (multi-device send-side sync). When the user sends a message
+/// from one device, that device also seals a `carbon` to the user's OWN
+/// identity (to_uin = me) wrapping the original envelope plus its
+/// destination. The user's other logged-in devices unwrap it and file
+/// the inner message as `fromMe` in the destination thread. Exactly one
+/// of `to` (1:1 peer UIN) / `gid` (group id) is set. Defined identically
+/// on iOS/Android/web. The origin device re-receives its own carbon and
+/// must no-op it (dedup by the inner envelope's id).
+export interface CarbonEnvelope {
+  kind: 'carbon'
+  to?: number | null // 1:1 destination peer UIN (omit/null for a group carbon)
+  gid?: number | null // group destination id (omit/null for a 1:1 carbon)
+  env: Envelope // the original sent envelope (text/photo/…)
+}
+
+export type Envelope = TextEnvelope | ReactionEnvelope | PhotoEnvelope | CarbonEnvelope
 
 /// Identity material a web session needs to send v=1 envelopes.
 /// Bundled by the iOS app and shipped via the linking QR. Web reads
@@ -170,7 +185,7 @@ export function newUUIDv4(): string {
 /// encoding works — only matters that the SAME bytes get embedded
 /// in the inner `env` field AND signed-over (the iOS decryptor
 /// verifies the sig against `ek || env_bytes` from the wire).
-export function encodeEnvelopeBytes(env: Envelope): Uint8Array {
+export function envelopeToObject(env: Envelope): Record<string, unknown> {
   // Build the object in the exact shape iOS `Envelope.encode(to:)`
   // produces. Key order doesn't strictly matter for decoding but
   // keeps signed-bytes deterministic across sender/test runs.
@@ -194,8 +209,19 @@ export function encodeEnvelopeBytes(env: Envelope): Uint8Array {
     if (env.caption != null) obj.caption = env.caption
     if (env.fwdName != null) obj.fwdName = env.fwdName
     if (env.reply != null) obj.reply = env.reply
+  } else if (env.kind === 'carbon') {
+    // Multi-device carbon: include only the destination that's set
+    // (encodeIfPresent style, matches iOS/Android), nest the original
+    // envelope as a sub-object so the other device decodes it directly.
+    if (env.to != null) obj.to = env.to
+    if (env.gid != null) obj.gid = env.gid
+    obj.env = envelopeToObject(env.env)
   }
-  return new TextEncoder().encode(JSON.stringify(obj))
+  return obj
+}
+
+export function encodeEnvelopeBytes(env: Envelope): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify(envelopeToObject(env)))
 }
 
 // -----------------------------------------------------------

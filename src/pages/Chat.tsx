@@ -35,11 +35,20 @@ import {
   encryptV1,
   bytesToB64,
   newUUIDv4,
+  type CarbonEnvelope,
   type Envelope,
   type ReactionEnvelope,
   type ReplyContext,
   type TextEnvelope,
 } from '../lib/crypto'
+import {
+  type OutgoingRow,
+  storageKey,
+  loadPersisted,
+  savePersisted,
+  appendToThreadLog,
+  setOutgoingSink,
+} from '../lib/outgoing-store'
 import { encryptGroupEnvelope } from '../lib/group-crypto'
 import { parseGroupInviteId } from '../lib/group-invite'
 import { GroupJoinCard } from '../components/GroupJoinCard'
@@ -51,85 +60,11 @@ import { useI18n } from '../lib/i18n-context'
 import { useIdentity } from '../lib/identity-context'
 import { playSound } from '../lib/sounds'
 
-interface OutgoingRow {
-  id: string
-  text: string
-  sentAt: number
-  state: 'sending' | 'sent' | 'failed'
-  error?: string
-  /// Photo attachment. When set this row renders as an image (the
-  /// blob lives encrypted at /media/<mediaId>, decrypted with
-  /// mediaKey); `text` is the optional caption.
-  kind?: 'text' | 'photo'
-  mediaId?: string
-  mediaKey?: string
-  /// Snippet of message we're replying to + author. Populated on send
-  /// when the user composes from "reply mode"; persisted so reloads
-  /// preserve the quote-block above the bubble.
-  replyTo?: ReplyContext
-  /// Original author nickname when this row is a forward. Mirrors
-  /// iOS `forwardedFromName` — the recipient renders "forwarded
-  /// from <name>" above the body.
-  fwdName?: string
-  /// Asset name of the local user's reaction on this message, if any.
-  /// Local UI state — the reaction envelope is shipped via the wire
-  /// path; this field is what makes the bubble decoration durable
-  /// across reloads.
-  myReaction?: string
-}
-
 const REACTION_SUPPORTED_KINDS = new Set<Envelope['kind']>(['text', 'reaction', 'photo'])
 
-/// Per-thread storage key for the outgoing log. Keys look like
-/// `rcq.web.outgoing.peer.123` / `.group.42`. Stored per-thread
-/// rather than as one combined log so opening many chats doesn't
-/// load every send the user has ever made.
-function storageKey(isGroup: boolean, idNum: number): string {
-  return `rcq.web.outgoing.${isGroup ? 'group' : 'peer'}.${idNum}`
-}
-
-/// Cap on persisted rows per thread. Phase-1 chat is send-only,
-/// so the log is mostly "what did I say". 200 rows covers a long
-/// conversation; older rows fall off so localStorage stays bounded.
-const MAX_PERSISTED_ROWS = 200
-
-function loadPersisted(key: string): OutgoingRow[] {
-  try {
-    const raw = localStorage.getItem(key)
-    if (!raw) return []
-    const arr = JSON.parse(raw) as OutgoingRow[]
-    // Failed sends are kept for the user to see the red bang, but
-    // 'sending' rows from a previous session were never delivered
-    // — surface them as failed on rehydrate so the user retries.
-    return arr.map((r) => (r.state === 'sending' ? { ...r, state: 'failed' } : r))
-  } catch {
-    return []
-  }
-}
-
-function savePersisted(key: string, rows: OutgoingRow[]) {
-  const trimmed = rows.length > MAX_PERSISTED_ROWS
-    ? rows.slice(rows.length - MAX_PERSISTED_ROWS)
-    : rows
-  try {
-    localStorage.setItem(key, JSON.stringify(trimmed))
-  } catch {
-    // QuotaExceeded etc. — skip. The in-memory log still works.
-  }
-}
-
-/// Append a row to a thread's persisted outgoing log without going
-/// through component state — used by forwarding, where the target
-/// thread isn't the one currently open. Loads, appends, trims, saves
-/// in one shot. If the user is currently looking at the target
-/// thread it will refresh on next render via the useEffect[persistKey]
-/// reload — but in phase-1 forwards target a *different* thread by
-/// definition (you don't usually forward to yourself), so the
-/// happy-path is a write the user sees later when they navigate.
-function appendToThreadLog(key: string, row: OutgoingRow) {
-  const existing = loadPersisted(key)
-  savePersisted(key, [...existing, row])
-}
+/// Message kinds we mirror to the user's other devices via a carbon
+/// (NOT reactions — those sync through their own self-echo).
+const CARBON_KINDS = new Set<Envelope['kind']>(['text', 'photo'])
 
 function buildSnippet(text: string): string {
   const collapsed = text.replace(/\s+/g, ' ').trim()
@@ -161,6 +96,11 @@ export function Chat() {
   const [uploadingPhoto, setUploadingPhoto] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
+  // The scrolling message pane (<main>). We scroll this element directly to
+  // its bottom rather than scrollIntoView-ing a zero-height anchor — the
+  // anchor approach was landing short, leaving the newest messages tucked
+  // behind the sticky composer when a thread opened (founder report).
+  const scrollRef = useRef<HTMLDivElement>(null)
   // Lazy initial loader pulls the persisted log straight off
   // localStorage so the first paint already shows the user's
   // history. New rows append + write-through; failed-on-reload
@@ -248,7 +188,13 @@ export function Chat() {
   useEffect(() => {
     const switched = lastThreadRef.current !== persistKey
     lastThreadRef.current = persistKey
-    bottomRef.current?.scrollIntoView({ behavior: switched ? 'auto' : 'smooth', block: 'end' })
+    const el = scrollRef.current
+    if (!el) return
+    const behavior: ScrollBehavior = switched ? 'auto' : 'smooth'
+    // Defer past layout so late content (queued history, decrypted images)
+    // is measured before we pin to the bottom — otherwise the jump lands
+    // short and the last bubbles hide under the composer.
+    requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior }))
   }, [outgoing.length, incoming.length, persistKey])
 
   // Mark this thread as the active one: clears its unread badge on open
@@ -258,6 +204,17 @@ export function Chat() {
     setActiveThread(key)
     return () => setActiveThread(null)
   }, [isGroup, groupId, peerUIN])
+
+  // Register a live sink so multi-device carbons (a message this user sent
+  // from another device) for the OPEN thread appear instantly — merged into
+  // state, deduped by id. Carbons for other threads go to localStorage.
+  useEffect(() => {
+    if (!persistKey) return
+    setOutgoingSink(persistKey, (row) =>
+      setOutgoing((rows) => (rows.some((r) => r.id === row.id) ? rows : [...rows, row])),
+    )
+    return () => setOutgoingSink(null, null)
+  }, [persistKey])
 
   // Auto-clear the transient notice (forward toast) after a moment
   // so it doesn't linger on the screen.
@@ -305,9 +262,38 @@ export function Chat() {
       } else {
         throw new Error('no target')
       }
+      // Mirror this message to the user's other devices (best-effort).
+      void sendMessageCarbon(envelope)
       return { ok: true }
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : t('chat.error.send_failed') }
+    }
+  }
+
+  /// Mirror a just-sent message to the user's OTHER devices: seal a `carbon`
+  /// (the original envelope + its destination) to our own identity and deposit
+  /// it to our own uin. The other device unwraps it and files the inner
+  /// message as fromMe in the destination thread; the origin device dedups its
+  /// own carbon by id. Reactions are excluded (they sync via their own
+  /// self-echo). Best-effort — the message already went out.
+  async function sendMessageCarbon(inner: Envelope) {
+    if (!identity || !CARBON_KINDS.has(inner.kind)) return
+    try {
+      const carbon: CarbonEnvelope = {
+        kind: 'carbon',
+        to: isGroup ? null : peer?.uin ?? null,
+        gid: isGroup ? group?.id ?? null : null,
+        env: inner,
+      }
+      const selfBundle = peerBundleFrom({
+        uin: identity.uin,
+        identity_key: bytesToB64(identity.identityPub),
+        signing_key: bytesToB64(identity.signingPub),
+      })
+      const wireB64 = encryptV1(carbon, identity, selfBundle)
+      await Api.sendSealed(identity, identity.uin, wireB64)
+    } catch {
+      /* best-effort multi-device echo; ignore */
     }
   }
 
@@ -611,7 +597,7 @@ export function Chat() {
         </div>
       )}
 
-      <main className="flex-1 max-w-2xl w-full mx-auto px-4 py-4 overflow-y-auto no-scrollbar">
+      <main ref={scrollRef} className="flex-1 max-w-2xl w-full mx-auto px-4 py-4 overflow-y-auto no-scrollbar">
         {error && (
           <div className="bg-red-50 border border-red-200 rounded-md p-3 text-sm text-red-600 mb-4">
             {error}
@@ -755,6 +741,21 @@ export function Chat() {
                             </button>
                           </>
                         )}
+                      </div>
+                    </div>
+                  </li>
+                )
+              }
+              if (row.kind === 'other') {
+                // An in-app-only media (voice/video/file/location) the user
+                // sent from another device, echoed here via a carbon.
+                return (
+                  <li key={row.id} className="flex justify-end">
+                    <div className="max-w-[80%] flex flex-col items-end gap-1">
+                      <MediaPlaceholder mediaKind={row.mediaKind} />
+                      <div className="flex items-center justify-end gap-1 text-[10px] font-mono text-fg-dim">
+                        {new Date(row.sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        <span className="text-accent">✓</span>
                       </div>
                     </div>
                   </li>

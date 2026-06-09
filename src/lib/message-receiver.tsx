@@ -8,9 +8,16 @@ import { useIdentity } from './identity-context'
 import { useWS } from './ws'
 import { decryptIncoming, getDevice } from './signal-device'
 import { addIncoming, addGroupIncoming, hydrateIncoming } from './incoming-store'
+import { fileOutgoingCarbon } from './outgoing-store'
 
 // Route a decrypted envelope to the 1:1 store or the group store by group_id.
-function route(senderUIN: number, envelope: Parameters<typeof addIncoming>[1], groupId: unknown): void {
+// `myUin` gates carbons (a message we sent from another device, echoed to our
+// own uin) — only honour one that's actually signed by us.
+function route(senderUIN: number, envelope: Parameters<typeof addIncoming>[1], groupId: unknown, myUin: number): void {
+  if (envelope.kind === 'carbon') {
+    if (senderUIN === myUin) fileOutgoingCarbon(envelope)
+    return
+  }
   if (typeof groupId === 'number') addGroupIncoming(groupId, senderUIN, envelope)
   else addIncoming(senderUIN, envelope)
 }
@@ -40,7 +47,7 @@ export function MessageReceiver() {
         for (const r of rows) {
           if (cancelled) return
           const got = await decryptIncoming(identity, r.payload)
-          if (got) route(got.senderUIN, got.envelope, r.group_id)
+          if (got) route(got.senderUIN, got.envelope, r.group_id, identity.uin)
         }
       } catch {
         /* network hiccup — next reconnect drains again (queue isn't acked here) */
@@ -58,7 +65,7 @@ export function MessageReceiver() {
       const payload = ev.payload as string | undefined
       if (!payload) return
       void decryptIncoming(identity, payload).then((got) => {
-        if (got) route(got.senderUIN, got.envelope, ev.group_id)
+        if (got) route(got.senderUIN, got.envelope, ev.group_id, identity.uin)
       })
     })
   }, [identity, on])
