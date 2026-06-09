@@ -217,10 +217,10 @@ export const Api = {
 
   // Messages ------------------------------------------------
 
-  sendSealed(id: WebIdentity, toUIN: number, payload: string): Promise<void> {
+  sendSealed(id: WebIdentity, toUIN: number, payload: string, envelopeType: string = 'message'): Promise<void> {
     return request<void>(id, 'POST', '/messages/sealed', {
       to_uin: toUIN,
-      envelope_type: 'message',
+      envelope_type: envelopeType,
       payload,
     })
   },

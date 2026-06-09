@@ -291,7 +291,9 @@ export function Chat() {
         signing_key: bytesToB64(identity.signingPub),
       })
       const wireB64 = encryptV1(carbon, identity, selfBundle)
-      await Api.sendSealed(identity, identity.uin, wireB64)
+      // Non-pushable type — syncs over WS / the per-device queue, never pushes
+      // a "new message" alert to our own phone for a message we sent.
+      await Api.sendSealed(identity, identity.uin, wireB64, 'carbon')
     } catch {
       /* best-effort multi-device echo; ignore */
     }
