@@ -129,6 +129,24 @@ export interface RCQGroup {
   // it; otherwise the avatar is generated from `avatar_seed`.
   avatar_media_id?: string | null
   avatar_media_key?: string | null
+  // Owner/admin-set plaintext pinned announcement (NULL = none).
+  pinned_text?: string | null
+}
+
+/// Live poll state from `/polls/{id}`. `voter_uins` is populated only for
+/// non-anonymous polls (the backend strips it otherwise).
+export interface PollTally {
+  option_index: number
+  count: number
+  voter_uins: number[]
+}
+export interface PollOut {
+  poll_id?: number
+  creator_uin?: number
+  closed_at?: string | null
+  tallies: PollTally[]
+  total_votes: number
+  my_votes: number[]
 }
 
 /// Lightweight group info shown to a non-member who's about to join
@@ -242,6 +260,16 @@ export const Api = {
 
   groupInfo(id: WebIdentity, groupId: number): Promise<RCQGroup> {
     return request<RCQGroup>(id, 'GET', `/groups/${groupId}`)
+  },
+
+  // Live poll tallies (counts + my_votes + voter_uins for non-anonymous).
+  loadPoll(id: WebIdentity, pollId: number): Promise<PollOut> {
+    return request<PollOut>(id, 'GET', `/polls/${pollId}`)
+  },
+
+  // Toggle the caller's vote on an option; returns the refreshed tally.
+  votePoll(id: WebIdentity, pollId: number, optionIndex: number): Promise<PollOut> {
+    return request<PollOut>(id, 'POST', `/polls/${pollId}/vote`, { option_index: optionIndex })
   },
 
   createGroup(id: WebIdentity, name: string, memberUINs: number[]): Promise<RCQGroup> {

@@ -9,6 +9,7 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { ContactActionsMenu } from '../components/ContactActionsMenu'
+import { GroupActionsMenu } from '../components/GroupActionsMenu'
 import { CreateGroupSheet } from '../components/CreateGroupSheet'
 import { GroupAvatar } from '../components/GroupAvatar'
 import { StatusIcon } from '../components/StatusIcon'
@@ -22,13 +23,16 @@ import {
   type UserInfo,
   type UserStatus,
 } from '../lib/api'
-import { usePeerUnread, useGroupUnread } from '../lib/incoming-store'
+import { usePeerUnread, useGroupUnread, useTotalUnread, peerUnreadCount, groupUnreadCount } from '../lib/incoming-store'
 import { useI18n } from '../lib/i18n-context'
 import { useIdentity } from '../lib/identity-context'
 import {
   useArchive,
+  useArchiveGroups,
   useCollapsedSections,
   useFavorites,
+  useFavoriteGroups,
+  useMutedGroups,
   useMutedPeers,
 } from '../lib/local-store'
 import { isPresenceSoundEnabled, playSound } from '../lib/sounds'
@@ -62,6 +66,15 @@ export function lookupContactStatus(viewerUin: number, uin: number): UserStatus 
 export function lookupGroupName(viewerUin: number, id: number): string | null {
   return _contactsCache.get(viewerUin)?.groups.find((g) => g.id === id)?.name || null
 }
+/// Group avatar media off the warm cache — so a group toast can show the
+/// group's avatar, not just a glyph. Null when cold / no custom avatar.
+export function lookupGroupAvatar(
+  viewerUin: number,
+  id: number,
+): { mediaId?: string | null; mediaKey?: string | null } | null {
+  const g = _contactsCache.get(viewerUin)?.groups.find((x) => x.id === id)
+  return g ? { mediaId: g.avatar_media_id, mediaKey: g.avatar_media_key } : null
+}
 
 export function Contacts() {
   const { identity } = useIdentity()
@@ -80,7 +93,12 @@ export function Contacts() {
   const favorites = useFavorites()
   const archive = useArchive()
   const muted = useMutedPeers()
+  const favoriteGroups = useFavoriteGroups()
+  const archiveGroups = useArchiveGroups()
   const collapsed = useCollapsedSections()
+  // Subscribe to unread changes so the list re-sorts (unread-first) + the
+  // section counts update when a message arrives. (Value itself unused here.)
+  useTotalUnread()
 
   async function refresh(background = false) {
     if (!identity) return
@@ -206,11 +224,35 @@ export function Contacts() {
     else if (isAround(c.status)) online.push(c)
     else offline.push(c)
   }
+  // Bucket groups the same way (separate fav/archive sets so a group id can't
+  // collide with a contact UIN): archived groups leave the Groups list and join
+  // the bottom Archive section; favorited groups float to the top Favorites.
+  const favGroups: RCQGroup[] = []
+  const archivedGroups: RCQGroup[] = []
+  const normalGroups: RCQGroup[] = []
+  for (const g of groups) {
+    if (archiveGroups.has(g.id)) archivedGroups.push(g)
+    else if (favoriteGroups.has(g.id)) favGroups.push(g)
+    else normalGroups.push(g)
+  }
   const sortByNick = (a: Contact, b: Contact) => a.nickname.localeCompare(b.nickname)
-  fav.sort(sortByNick)
-  online.sort(sortByNick)
-  offline.sort(sortByNick)
+  // Unread-first: a contact who messaged you floats to the top of its section
+  // (so the offline contact who wrote while away is right at the top — founder
+  // ask), then alphabetical. Same for groups by name.
+  const byUnreadThenNick = (a: Contact, b: Contact) =>
+    (peerUnreadCount(b.uin) > 0 ? 1 : 0) - (peerUnreadCount(a.uin) > 0 ? 1 : 0) || sortByNick(a, b)
+  const groupByUnreadThenName = (a: RCQGroup, b: RCQGroup) =>
+    (groupUnreadCount(b.id) > 0 ? 1 : 0) - (groupUnreadCount(a.id) > 0 ? 1 : 0) ||
+    a.name.localeCompare(b.name)
+  fav.sort(byUnreadThenNick)
+  online.sort(byUnreadThenNick)
+  offline.sort(byUnreadThenNick)
   archived.sort(sortByNick)
+  favGroups.sort(groupByUnreadThenName)
+  normalGroups.sort(groupByUnreadThenName)
+  // Sum unread per section so the section header can show "N unread".
+  const sectionUnread = (cs: Contact[]) => cs.reduce((n, c) => n + (peerUnreadCount(c.uin) > 0 ? 1 : 0), 0)
+  const groupSectionUnread = (gs: RCQGroup[]) => gs.reduce((n, g) => n + (groupUnreadCount(g.id) > 0 ? 1 : 0), 0)
 
   return (
     <div className="min-h-screen bg-surface-dim">
@@ -292,13 +334,38 @@ export function Contacts() {
           </div>
         )}
 
-        {fav.length > 0 && (
+        {/* Saved Messages («Заметки») — your own UIN as a notes-to-self thread.
+            Always on top, like the native apps. The server never lists your
+            own UIN in /contacts, so this is the only entry point. */}
+        {me && (
+          <ul className="bg-surface rounded-lg border border-line [&_li:first-child_a]:rounded-t-lg [&_li:last-child_a]:rounded-b-lg">
+            <li>
+              <Link
+                to={`/chat/${me.uin}`}
+                className="flex items-center gap-3 px-4 py-3 hover:bg-surface-dim transition-colors"
+              >
+                <span className="flex h-7 w-7 flex-none items-center justify-center rounded-full bg-accent/15 text-accent">
+                  <BookmarkGlyph />
+                </span>
+                <div className="flex-1 min-w-0">
+                  <div className="font-medium truncate">{t('contacts.saved')}</div>
+                  <div className="text-xs text-fg-dim truncate">{t('contacts.saved.subtitle')}</div>
+                </div>
+              </Link>
+            </li>
+          </ul>
+        )}
+
+        {fav.length + favGroups.length > 0 && (
           <Section
             id="fav"
             title={t('section.favorites')}
-            count={fav.length}
+            count={fav.length + favGroups.length}
             collapsed={collapsed}
           >
+            {favGroups.map((g) => (
+              <GroupRow key={`g${g.id}`} group={g} onChanged={refresh} />
+            ))}
             {fav.map((c) => (
               <ContactRow
                 key={c.uin}
@@ -314,7 +381,8 @@ export function Contacts() {
         <Section
           id="groups"
           title={t('section.groups')}
-          count={groups.length}
+          count={normalGroups.length}
+          unread={groupSectionUnread(normalGroups)}
           collapsed={collapsed}
           rightAction={
             <button
@@ -325,10 +393,10 @@ export function Contacts() {
             </button>
           }
         >
-          {groups.length === 0 ? (
+          {normalGroups.length === 0 ? (
             <li className="px-4 py-3 text-xs text-fg-dim">{t('section.groups.empty')}</li>
           ) : (
-            groups.map((g) => <GroupRow key={g.id} group={g} />)
+            normalGroups.map((g) => <GroupRow key={g.id} group={g} onChanged={refresh} />)
           )}
         </Section>
 
@@ -337,6 +405,7 @@ export function Contacts() {
             id="online"
             title={t('section.online')}
             count={online.length}
+            unread={sectionUnread(online)}
             collapsed={collapsed}
           >
             {online.map((c) => (
@@ -355,6 +424,7 @@ export function Contacts() {
             id="offline"
             title={t('section.offline')}
             count={offline.length}
+            unread={sectionUnread(offline)}
             collapsed={collapsed}
           >
             {offline.map((c) => (
@@ -368,14 +438,17 @@ export function Contacts() {
           </Section>
         )}
 
-        {archived.length > 0 && (
+        {archived.length + archivedGroups.length > 0 && (
           <Section
             id="archive"
             title={t('section.archive')}
-            count={archived.length}
+            count={archived.length + archivedGroups.length}
             collapsed={collapsed}
             collapsedByDefault
           >
+            {archivedGroups.map((g) => (
+              <GroupRow key={`g${g.id}`} group={g} onChanged={refresh} />
+            ))}
             {archived.map((c) => (
               <ContactRow
                 key={c.uin}
@@ -411,6 +484,7 @@ function Section({
   id,
   title,
   count,
+  unread = 0,
   children,
   collapsed,
   collapsedByDefault,
@@ -419,6 +493,7 @@ function Section({
   id: string
   title: string
   count: number
+  unread?: number
   children: React.ReactNode
   collapsed: { has: (id: string) => boolean; toggle: (id: string) => void }
   collapsedByDefault?: boolean
@@ -440,6 +515,11 @@ function Section({
           <span className="text-fg-dim">{isCollapsed ? '▸' : '▾'}</span>
           {title}
           <span className="text-fg-dim font-mono">·{count}</span>
+          {unread > 0 && (
+            <span className="ml-1 inline-flex items-center justify-center min-w-[16px] h-4 px-1 rounded-full bg-red-500 text-white text-[10px] font-bold tracking-normal">
+              {unread > 99 ? '99+' : unread}
+            </span>
+          )}
         </button>
         {rightAction}
       </div>
@@ -496,7 +576,7 @@ function ContactRow({
               </span>
               <GenderIcon gender={contact.gender} />
               {favorite && <span className="text-yellow-500 text-xs flex-none">★</span>}
-              {muted && <span className="text-fg-dim text-xs flex-none">🔕</span>}
+              {muted && <MuteGlyph />}
               {contact.blocked && <BlockedIcon />}
             </div>
             <div className="flex items-center gap-1.5 text-xs text-fg-dim min-w-0">
@@ -536,42 +616,81 @@ function ContactRow({
   )
 }
 
-function GroupRow({ group }: { group: RCQGroup }) {
+function GroupRow({ group, onChanged }: { group: RCQGroup; onChanged: () => void }) {
   const { t } = useI18n()
   const unread = useGroupUnread(group.id)
+  const muted = useMutedGroups()
+  const favorites = useFavoriteGroups()
+  const archive = useArchiveGroups()
+  const [menuOpen, setMenuOpen] = useState(false)
+  const isMuted = muted.has(group.id)
+  const isFav = favorites.has(group.id)
+  const isArchived = archive.has(group.id)
+  // The card opens the chat; the ⋮ opens an actions MENU (not a page
+  // navigation — the founder read navigating to the group page as "the group
+  // opens"). Mirrors ContactRow. Links are siblings, never nested <a>.
   return (
-    <li>
-      <Link
-        to={`/chat/g/${group.id}`}
-        className="flex items-center gap-3 px-4 py-3 hover:bg-surface-dim transition-colors"
-      >
-        <GroupAvatar size={28} mediaId={group.avatar_media_id} mediaKey={group.avatar_media_key} />
-        <div className="flex-1 min-w-0">
-          <div className={'truncate ' + (unread > 0 ? 'font-bold' : 'font-medium')}>{group.name}</div>
-          <div className="text-xs text-fg-dim">
-            {t('section.groups.members', { n: group.members.length })}
+    <li className="relative">
+      <div className={'flex items-center gap-3 px-4 py-3 hover:bg-surface-dim transition-colors ' + (isArchived ? 'opacity-60' : '')}>
+        <Link to={`/chat/g/${group.id}`} className="flex items-center gap-3 flex-1 min-w-0">
+          <GroupAvatar size={28} mediaId={group.avatar_media_id} mediaKey={group.avatar_media_key} />
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-1.5">
+              <span className={'truncate ' + (unread > 0 ? 'font-bold' : 'font-medium')}>{group.name}</span>
+              {isFav && <span className="text-yellow-500 text-xs flex-none">★</span>}
+              {isMuted && <MuteGlyph />}
+            </div>
+            <div className="text-xs text-fg-dim">
+              {t('section.groups.members', { n: group.members.length })}
+            </div>
           </div>
-        </div>
+        </Link>
         {unread > 0 && <UnreadBadge n={unread} />}
-        <Link
-          to={`/groups/${group.id}`}
-          onClick={(e) => e.stopPropagation()}
-          className="text-fg-secondary hover:text-fg-primary px-2"
+        <button
+          onClick={() => setMenuOpen((v) => !v)}
+          className="text-fg-secondary hover:text-fg-primary p-2 rounded-md hover:bg-surface"
           title={t('contacts.more')}
+          aria-label={t('contacts.more')}
         >
           <MoreIcon />
-        </Link>
-      </Link>
+        </button>
+      </div>
+      {menuOpen && (
+        <GroupActionsMenu group={group} onClose={() => setMenuOpen(false)} onChanged={onChanged} />
+      )}
     </li>
   )
 }
 
 // SVG icons -------------------------------------------------------
 
+// Muted indicator next to a contact/group name — a proper bell-with-slash
+// glyph, not an emoji (founder: "должна быть не эмодзи, а обычные иконки").
+function MuteGlyph() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="text-fg-dim flex-none" aria-hidden>
+      <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+      <path d="M18.63 13A17.89 17.89 0 0 1 18 8" />
+      <path d="M6.26 6.26A5.86 5.86 0 0 0 6 8c0 7-3 9-3 9h14" />
+      <path d="M18 8a6 6 0 0 0-9.33-5" />
+      <line x1="2" y1="2" x2="22" y2="22" />
+    </svg>
+  )
+}
+
 function PlusIcon() {
   return (
     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
       <path d="M10 4v12M4 10h12" />
+    </svg>
+  )
+}
+
+/// Bookmark glyph for the Saved Messages («Заметки») row.
+function BookmarkGlyph() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z" />
     </svg>
   )
 }

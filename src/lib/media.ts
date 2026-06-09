@@ -38,7 +38,12 @@ function sniffImageType(bytes: Uint8Array): string {
   return 'image/jpeg'
 }
 
-async function fetchAndDecrypt(apiBase: string, mediaId: string, keyB64: string): Promise<string | null> {
+/// Fetch the encrypted blob at `/media/{id}` and AES-256-GCM decrypt it to the
+/// raw plaintext ArrayBuffer. Shared by the image / video / file paths — none
+/// of them sniff or wrap here; the caller decides the MIME + how to present the
+/// bytes. Returns an ArrayBuffer (a valid BlobPart, avoiding the
+/// Uint8Array<ArrayBufferLike> ↔ BlobPart friction in newer TS DOM libs).
+async function fetchDecryptToBuffer(apiBase: string, mediaId: string, keyB64: string): Promise<ArrayBuffer | null> {
   try {
     const keyBytes = b64ToBytes(keyB64)
     if (keyBytes.length !== 32) return null
@@ -55,13 +60,33 @@ async function fetchAndDecrypt(apiBase: string, mediaId: string, keyB64: string)
     const iv = combinedBuf.slice(0, 12)
     const data = combinedBuf.slice(12) // ciphertext || tag
     const key = await crypto.subtle.importKey('raw', keyAb, { name: 'AES-GCM' }, false, ['decrypt'])
-    const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data)
-    const plain = new Uint8Array(plainBuf)
-    const blob = new Blob([plain], { type: sniffImageType(plain) })
-    return URL.createObjectURL(blob)
+    return await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data)
   } catch {
     return null
   }
+}
+
+async function fetchAndDecrypt(apiBase: string, mediaId: string, keyB64: string): Promise<string | null> {
+  const buf = await fetchDecryptToBuffer(apiBase, mediaId, keyB64)
+  if (!buf) return null
+  return URL.createObjectURL(new Blob([buf], { type: sniffImageType(new Uint8Array(buf)) }))
+}
+
+/// Sniff a video MIME from the leading magic bytes so `<video>` gets a usable
+/// type. mp4 / quicktime carry an `ftyp` box at offset 4; WebM/Matroska start
+/// with the EBML header. Defaults to video/mp4 (iOS records mp4).
+function sniffVideoType(bytes: Uint8Array): string {
+  if (
+    bytes.length >= 12 &&
+    bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70 // "ftyp"
+  ) {
+    if (bytes[8] === 0x71 && bytes[9] === 0x74) return 'video/quicktime' // "qt  " brand
+    return 'video/mp4'
+  }
+  if (bytes.length >= 4 && bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) {
+    return 'video/webm'
+  }
+  return 'video/mp4'
 }
 
 // -----------------------------------------------------------
@@ -152,4 +177,87 @@ export function loadEncryptedImage(
     if (url === null) _urlCache.delete(k)
   })
   return p
+}
+
+// -----------------------------------------------------------
+// File / document (#16) + video (#15) — the bytes are NOT images, so they
+// skip the image cache + sniffing. Files upload raw (no canvas re-encode);
+// videos decrypt-to-blob on demand for inline playback or download.
+// -----------------------------------------------------------
+
+export interface FileUploadResult {
+  mediaId: string
+  keyB64: string
+  size: number // plaintext byte length, for the `file` envelope's `size`
+}
+
+/// Encrypt + upload a raw file (document) with NO transformation — the bytes
+/// are sealed as-is (AES-256-GCM, CryptoKit `combined` layout nonce(12)‖ct‖tag)
+/// and POSTed to /media/upload. Mirrors uploadEncryptedImage but skips the
+/// canvas re-encode so arbitrary file types survive byte-for-byte. Returns the
+/// media id + base64 key + plaintext size for the `file` envelope, or null.
+export async function uploadEncryptedFile(apiBase: string, file: File): Promise<FileUploadResult | null> {
+  try {
+    const plaintext = await file.arrayBuffer()
+
+    const keyAb = new ArrayBuffer(32)
+    const keyView = new Uint8Array(keyAb)
+    crypto.getRandomValues(keyView)
+    const nonceAb = new ArrayBuffer(12)
+    const nonce = new Uint8Array(nonceAb)
+    crypto.getRandomValues(nonce)
+
+    const key = await crypto.subtle.importKey('raw', keyAb, { name: 'AES-GCM' }, false, ['encrypt'])
+    const ctBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonceAb }, key, plaintext)
+    const ct = new Uint8Array(ctBuf) // ciphertext || tag(16)
+
+    const combined = new Uint8Array(12 + ct.length)
+    combined.set(nonce, 0)
+    combined.set(ct, 12)
+
+    const form = new FormData()
+    form.append('blob', new Blob([combined], { type: 'application/octet-stream' }), 'file.bin')
+    const res = await fetch(`${apiBase}/media/upload`, { method: 'POST', body: form })
+    if (!res.ok) return null
+    const out = (await res.json()) as { media_id: string; size: number }
+    return { mediaId: out.media_id, keyB64: bytesToB64(keyView), size: plaintext.byteLength }
+  } catch {
+    return null
+  }
+}
+
+/// Fetch + decrypt a video to a fresh object URL for inline playback. NOT
+/// cached (videos are large — we don't pin many decrypted blobs in memory);
+/// the caller revokes the URL when the player unmounts. Null on failure.
+export async function loadEncryptedVideo(
+  apiBase: string,
+  mediaId: string,
+  keyB64: string,
+): Promise<string | null> {
+  const buf = await fetchDecryptToBuffer(apiBase, mediaId, keyB64)
+  if (!buf) return null
+  return URL.createObjectURL(new Blob([buf], { type: sniffVideoType(new Uint8Array(buf)) }))
+}
+
+/// Fetch + decrypt any media and trigger a browser download with the given
+/// file name + MIME. Returns false on failure so the caller can toast. The
+/// object URL is revoked shortly after the click fires.
+export async function downloadEncryptedFile(
+  apiBase: string,
+  mediaId: string,
+  keyB64: string,
+  fileName: string,
+  mime?: string,
+): Promise<boolean> {
+  const buf = await fetchDecryptToBuffer(apiBase, mediaId, keyB64)
+  if (!buf) return false
+  const url = URL.createObjectURL(new Blob([buf], { type: mime || 'application/octet-stream' }))
+  const a = document.createElement('a')
+  a.href = url
+  a.download = fileName || 'file'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 30_000)
+  return true
 }

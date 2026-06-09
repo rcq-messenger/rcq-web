@@ -208,15 +208,20 @@ export function Settings() {
           <p className="text-xs text-fg-dim">{t('settings.session.unlink_footer')}</p>
         </section>
 
-        <section className="bg-surface rounded-lg border border-red-200 p-4 space-y-3">
-          <div className="text-xs font-semibold text-red-600 uppercase tracking-wide">
+        {/* Burn account — redesigned off the old "red-outlined everything"
+            look (founder disliked the red lines): a NEUTRAL card with a single
+            warning glyph; red is reserved for the one truly destructive action
+            (the final confirm button) so it reads as deliberate, not alarming. */}
+        <section className="bg-surface rounded-lg border border-line p-4 space-y-3">
+          <div className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-fg-secondary">
+            <WarnIcon />
             {t('settings.section.danger')}
           </div>
           <p className="text-xs text-fg-secondary">{t('settings.danger.body')}</p>
           {!confirming ? (
             <button
               onClick={() => setConfirming(true)}
-              className="w-full h-10 rounded-md border border-red-300 text-sm font-medium text-red-600 hover:bg-red-50 transition-colors"
+              className="w-full h-10 rounded-md border border-line text-sm font-medium text-red-600 hover:bg-line/40 transition-colors"
             >
               {t('settings.danger.cta')}
             </button>
@@ -236,7 +241,7 @@ export function Settings() {
                 value={burnTyped}
                 onChange={(e) => setBurnTyped(e.target.value)}
                 placeholder={String(identity.uin)}
-                className="w-full h-10 px-3 rounded-md border border-red-300 bg-red-50/30 outline-none focus:border-red-500 focus:ring-1 focus:ring-red-500 text-sm font-mono text-center"
+                className="w-full h-10 px-3 rounded-md border border-line bg-surface-dim outline-none focus:border-accent focus:ring-1 focus:ring-accent text-sm font-mono text-center"
                 autoFocus
               />
               <button
@@ -259,13 +264,23 @@ export function Settings() {
             </div>
           )}
           {error && (
-            <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-md p-2">
+            <div className="text-sm text-red-600 bg-red-500/5 rounded-md p-2">
               {error}
             </div>
           )}
         </section>
       </main>
     </div>
+  )
+}
+
+function WarnIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="text-red-600">
+      <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+      <line x1="12" y1="9" x2="12" y2="13" />
+      <line x1="12" y1="17" x2="12.01" y2="17" />
+    </svg>
   )
 }
 

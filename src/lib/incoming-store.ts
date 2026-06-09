@@ -14,13 +14,31 @@ export interface IncomingRow {
   text: string // text body, or the caption for a photo, or '' for other media
   at: number // ms received
   // Defaults to 'text' when absent (back-compat with rows persisted before
-  // media support). 'photo' carries mediaId/mediaKey; 'other' is an
-  // unsupported-on-web media kind (video/voice/file/location) shown as a label.
-  kind?: 'text' | 'photo' | 'other'
+  // media support). 'photo'/'video'/'file' carry mediaId/mediaKey (+ poster /
+  // file metadata); 'other' is a still-unsupported media kind (voice/location)
+  // shown as a label.
+  kind?: 'text' | 'photo' | 'video' | 'file' | 'other' | 'poll'
   mediaId?: string
   mediaKey?: string
   mediaKind?: string // for 'other': the original envelope kind
+  thumbnailB64?: string // for 'video': base64 JPEG poster
+  durationSec?: number // for 'video': length in seconds
+  fileName?: string // for 'file': original name
+  fileMime?: string // for 'file': content type
+  fileSize?: number // for 'file': plaintext byte length
+  poll?: PollRow // for 'poll': the ballot (rendered + votable)
   replyTo?: ReplyContext // quoted message this is a reply to (if any)
+  edited?: boolean // author edited this message after sending
+}
+
+/// A group poll carried inline in a 'poll' message — enough to render the
+/// ballot offline; live tallies + voting hit /polls/{pollId}.
+export interface PollRow {
+  pollId: number
+  question: string
+  options: string[]
+  single: boolean
+  anon: boolean
 }
 
 /// Build an IncomingRow from a decrypted envelope, or null for kinds we
@@ -45,9 +63,55 @@ function rowFromEnvelope(from: number, env: Envelope): IncomingRow | null {
       replyTo: env.reply,
     }
   }
+  // Video (#15): keep the media ref + poster + duration so the web can play /
+  // download it, not just label it.
+  if (env.kind === 'video') {
+    return {
+      id: env.id,
+      from,
+      text: env.caption ?? '',
+      at: Date.now(),
+      kind: 'video',
+      mediaId: env.mediaID,
+      mediaKey: env.mediaKey,
+      thumbnailB64: env.thumbnailB64,
+      durationSec: env.durationSec,
+      replyTo: env.reply,
+    }
+  }
+  // File / document (#16): keep the media ref + name/mime/size for the
+  // download chip.
+  if (env.kind === 'file') {
+    return {
+      id: env.id,
+      from,
+      text: env.caption ?? '',
+      at: Date.now(),
+      kind: 'file',
+      mediaId: env.mediaID,
+      mediaKey: env.mediaKey,
+      fileName: env.fname,
+      fileMime: env.mime,
+      fileSize: env.size,
+      replyTo: env.reply,
+    }
+  }
   const loose = env as { kind?: string; id?: string; caption?: string }
-  if (loose.id && (loose.kind === 'video' || loose.kind === 'voice' || loose.kind === 'file' || loose.kind === 'location')) {
+  if (loose.id && (loose.kind === 'voice' || loose.kind === 'location')) {
     return { id: loose.id, from, text: loose.caption ?? '', at: Date.now(), kind: 'other', mediaKind: loose.kind }
+  }
+  // Group poll (terse wire keys poll/q/opts/sc/anon — see PollEnvelope). Was
+  // silently dropped, so polls were invisible on web (#7).
+  if (loose.kind === 'poll' && loose.id) {
+    const p = env as unknown as { id: string; poll: number; q?: string; opts?: string[]; sc?: boolean; anon?: boolean }
+    return {
+      id: p.id,
+      from,
+      text: p.q ?? '', // question doubles as the toast/preview text
+      at: Date.now(),
+      kind: 'poll',
+      poll: { pollId: p.poll, question: p.q ?? '', options: p.opts ?? [], single: !!p.sc, anon: !!p.anon },
+    }
   }
   return null
 }
@@ -146,7 +210,7 @@ export interface Toast {
   from: number // sender UIN
   groupId: number | null
   text: string // snippet/caption ('' for media w/o caption)
-  kind: 'text' | 'photo' | 'other'
+  kind: 'text' | 'photo' | 'video' | 'file' | 'other'
 }
 const toastListeners = new Set<(t: Toast) => void>()
 
@@ -191,12 +255,18 @@ function bumpUnread(threadKey: string, row: IncomingRow, groupId: number | null)
     persistUnread()
     emitUnread()
     playSound('message_incoming')
+    // Media kinds pass through for a typed preview; text/poll/undefined show
+    // their text (poll text is the question).
+    const tk: Toast['kind'] =
+      row.kind === 'photo' || row.kind === 'video' || row.kind === 'file' || row.kind === 'other'
+        ? row.kind
+        : 'text'
     const toast: Toast = {
       id: row.id,
       from: row.from,
       groupId,
       text: row.text,
-      kind: (row.kind ?? 'text') as Toast['kind'],
+      kind: tk,
     }
     for (const l of toastListeners) l(toast)
   }
@@ -238,6 +308,15 @@ function subscribeUnread(cb: () => void): () => void {
   return () => {
     unreadListeners.delete(cb)
   }
+}
+
+/// Non-hook reads of the unread counts — for list-level sorting/section totals
+/// (call useTotalUnread() in the component so it re-renders on changes).
+export function peerUnreadCount(uin: number): number {
+  return unread.get(peerKey(uin)) ?? 0
+}
+export function groupUnreadCount(id: number): number {
+  return unread.get(groupKey(id)) ?? 0
 }
 
 export function usePeerUnread(uin: number | null): number {
@@ -302,11 +381,25 @@ export async function hydrateIncoming(uin: number): Promise<void> {
 }
 
 /// Ingest a decrypted 1:1 envelope (text/photo/other media). `from` is the sender.
+/// In-place edit of an already-received message (author changed its text).
+/// Replaces the thread array (new reference) so useSyncExternalStore re-renders.
+function applyEditTo(map: Map<number, IncomingRow[]>, key: number, targetID: string, text: string): void {
+  const prev = map.get(key)
+  if (!prev || !prev.some((r) => r.id === targetID)) return
+  map.set(key, prev.map((r) => (r.id === targetID ? { ...r, text, edited: true } : r)))
+  persist()
+  emit()
+}
+
 export function addIncoming(from: number, env: Envelope): void {
   // A reaction the peer placed on one of OUR messages (or removed) — apply
   // it to the reactions store rather than creating a message row.
   if (env.kind === 'reaction') {
     applyReaction(env.targetID, from, env.asset)
+    return
+  }
+  if (env.kind === 'edit') {
+    applyEditTo(byPeer, from, env.targetID, env.text)
     return
   }
   const row = rowFromEnvelope(from, env)
@@ -327,6 +420,10 @@ export function addIncoming(from: number, env: Envelope): void {
 export function addGroupIncoming(groupId: number, from: number, env: Envelope): void {
   if (env.kind === 'reaction') {
     applyReaction(env.targetID, from, env.asset)
+    return
+  }
+  if (env.kind === 'edit') {
+    applyEditTo(byGroup, groupId, env.targetID, env.text)
     return
   }
   const row = rowFromEnvelope(from, env)

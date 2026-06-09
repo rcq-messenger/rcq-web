@@ -15,6 +15,8 @@ import { useEffect, useState, useSyncExternalStore } from 'react'
 const KEYS = {
   favorites: 'rcq.web.favorites',
   archive: 'rcq.web.archive',
+  favoriteGroups: 'rcq.web.favorites.groups',
+  archiveGroups: 'rcq.web.archive.groups',
   mutedPeers: 'rcq.web.muted.peers',
   mutedGroups: 'rcq.web.muted.groups',
   collapsed: 'rcq.web.contacts.collapsed', // section ids the user collapsed
@@ -99,6 +101,16 @@ export function useMutedPeers() {
 
 export function useMutedGroups() {
   return useNumberSet(KEYS.mutedGroups)
+}
+
+// Group-scoped favorite / archive — kept separate from the contact sets so a
+// group id can never collide with a contact UIN.
+export function useFavoriteGroups() {
+  return useNumberSet(KEYS.favoriteGroups)
+}
+
+export function useArchiveGroups() {
+  return useNumberSet(KEYS.archiveGroups)
 }
 
 // -----------------------------------------------------------

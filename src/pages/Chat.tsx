@@ -12,15 +12,15 @@
 // incoming yet). Forwards write into the target thread's storage
 // so the forwarded message shows up there when the user navigates.
 
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { AnimatePresence } from 'framer-motion'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { AnimatePresence, motion } from 'framer-motion'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { EmoticonPicker } from '../components/EmoticonPicker'
 import { EmoticonText } from '../components/EmoticonText'
 import { ForwardModal, type ForwardTarget } from '../components/ForwardModal'
 import { ReactionPicker } from '../components/ReactionPicker'
 import { StatusIcon } from '../components/StatusIcon'
-import { Api, peerBundleFrom, type Contact, type RCQGroup, type UserInfo } from '../lib/api'
+import { Api, peerBundleFrom, type Contact, type PollOut, type RCQGroup, type UserInfo } from '../lib/api'
 import {
   useIncoming,
   useGroupIncoming,
@@ -29,6 +29,7 @@ import {
   reactionsForTarget,
   aggregateReactions,
   useReactionsVersion,
+  type PollRow,
 } from '../lib/incoming-store'
 import { sendV2 } from '../lib/signal-device'
 import {
@@ -37,6 +38,7 @@ import {
   newUUIDv4,
   type CarbonEnvelope,
   type Envelope,
+  type EditEnvelope,
   type ReactionEnvelope,
   type ReplyContext,
   type TextEnvelope,
@@ -54,22 +56,41 @@ import { parseGroupInviteId } from '../lib/group-invite'
 import { GroupJoinCard } from '../components/GroupJoinCard'
 import { GroupAvatar } from '../components/GroupAvatar'
 import { DecryptedImage } from '../components/DecryptedImage'
-import { uploadEncryptedImage } from '../lib/media'
+import { DecryptedVideo } from '../components/DecryptedVideo'
+import { FileBubble } from '../components/FileBubble'
+import { uploadEncryptedImage, uploadEncryptedFile } from '../lib/media'
 import { emoticonAssetURL } from '../lib/emoticons'
 import { useI18n } from '../lib/i18n-context'
 import { useIdentity } from '../lib/identity-context'
 import { playSound } from '../lib/sounds'
 
-const REACTION_SUPPORTED_KINDS = new Set<Envelope['kind']>(['text', 'reaction', 'photo'])
+/// Envelope kinds `shipEnvelopeToCurrentThread` is allowed to encrypt + send.
+/// (Carbons take a separate path; this gates the in-thread sends.) `edit` was
+/// missing here, which silently rejected edit propagation to the peer.
+const SHIPPABLE_KINDS = new Set<Envelope['kind']>(['text', 'reaction', 'photo', 'video', 'file', 'edit'])
 
 /// Message kinds we mirror to the user's other devices via a carbon
 /// (NOT reactions — those sync through their own self-echo).
-const CARBON_KINDS = new Set<Envelope['kind']>(['text', 'photo'])
+const CARBON_KINDS = new Set<Envelope['kind']>(['text', 'photo', 'file'])
+
+/// Client-side cap on a document upload. The backend accepts up to 2 GB, but
+/// the web decrypts the whole blob into memory to download — keep that bounded.
+const MAX_FILE_BYTES = 100 * 1024 * 1024 // 100 MB
 
 function buildSnippet(text: string): string {
+  // Carry enough of the quoted message that the reply has context (#14 — a
+  // 60-char cut hid what was being answered). The quote renders clamped to a
+  // few lines, so a generous cap is fine.
   const collapsed = text.replace(/\s+/g, ' ').trim()
-  return collapsed.length > 60 ? collapsed.slice(0, 60) + '…' : collapsed
+  return collapsed.length > 220 ? collapsed.slice(0, 220) + '…' : collapsed
 }
+
+// Module-level caches of the open chat's peer / group info. The Chat route
+// remounts on every navigation; without this the header + composer blanked and
+// re-fetched each time ("everything reloads"). State inits from here → instant
+// paint, and the fetch refreshes silently in the background.
+const _peerCache = new Map<number, Contact>()
+const _groupCache = new Map<number, RCQGroup>()
 
 export function Chat() {
   const { identity } = useIdentity()
@@ -79,6 +100,11 @@ export function Chat() {
   const isGroup = params.groupId != null
   const peerUIN = isGroup ? null : Number(params.uin)
   const groupId = isGroup ? Number(params.groupId) : null
+  // A 1:1 thread pointed at your OWN UIN = "Saved Messages" / «Заметки» (notes
+  // to self). The server omits your own UIN from /contacts, so we synthesise a
+  // peer and keep the whole thread LOCAL — never delivered over the wire
+  // (mirrors iOS). #3.
+  const isSelf = !isGroup && identity != null && peerUIN === identity.uin
 
   // Per-thread persistence key. Recomputed every render — cheap;
   // string formatting only.
@@ -88,19 +114,44 @@ export function Chat() {
       ? storageKey(false, peerUIN)
       : null
 
-  const [peer, setPeer] = useState<Contact | null>(null)
-  const [group, setGroup] = useState<RCQGroup | null>(null)
+  const [peer, setPeer] = useState<Contact | null>(() =>
+    !isGroup && peerUIN != null ? _peerCache.get(peerUIN) ?? null : null,
+  )
+  const [group, setGroup] = useState<RCQGroup | null>(() =>
+    isGroup && groupId != null ? _groupCache.get(groupId) ?? null : null,
+  )
   const [myInfo, setMyInfo] = useState<UserInfo | null>(null)
   const [input, setInput] = useState('')
   const [showPicker, setShowPicker] = useState(false)
   const [uploadingPhoto, setUploadingPhoto] = useState(false)
+  const [uploadingFile, setUploadingFile] = useState(false)
+  // The attach button opens a small menu (Photo / File) — the web couldn't
+  // send documents before (#16). Each picks a different hidden <input>.
+  const [attachMenuOpen, setAttachMenuOpen] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const docInputRef = useRef<HTMLInputElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
+  // Auto-growing composer (#composer-expand): the textarea grows with its
+  // content up to a few lines, then scrolls — so a long message isn't cramped
+  // into one line in a small window. Reset back to one line after send.
+  const taRef = useRef<HTMLTextAreaElement>(null)
+  const autosize = () => {
+    const ta = taRef.current
+    if (!ta) return
+    ta.style.height = 'auto'
+    ta.style.height = Math.min(ta.scrollHeight, 140) + 'px'
+  }
+  useEffect(() => {
+    autosize()
+  }, [input])
   // The scrolling message pane (<main>). We scroll this element directly to
   // its bottom rather than scrollIntoView-ing a zero-height anchor — the
   // anchor approach was landing short, leaving the newest messages tucked
   // behind the sticky composer when a thread opened (founder report).
   const scrollRef = useRef<HTMLDivElement>(null)
+  // The message list (<ul>) — observed for height growth so we can re-pin to
+  // the bottom as late content (decrypting images, raised composer) settles.
+  const contentRef = useRef<HTMLUListElement>(null)
   // Lazy initial loader pulls the persisted log straight off
   // localStorage so the first paint already shows the user's
   // history. New rows append + write-through; failed-on-reload
@@ -113,7 +164,10 @@ export function Chat() {
   const [reactionForRowId, setReactionForRowId] = useState<string | null>(null)
   const [forwardingRow, setForwardingRow] = useState<OutgoingRow | null>(null)
   const [replyTo, setReplyTo] = useState<ReplyContext | null>(null)
+  // The own message currently being edited (composer is in edit mode), or null.
+  const [editingRow, setEditingRow] = useState<OutgoingRow | null>(null)
   const [transientNotice, setTransientNotice] = useState<string | null>(null)
+  const [pinExpanded, setPinExpanded] = useState(false)
   // Decrypted incoming messages, fed by the app-wide MessageReceiver (ws +
   // offline-queue → libsignal decrypt). 1:1 keyed by peer, group by group_id.
   const peerIncoming = useIncoming(isGroup ? null : peer?.uin ?? null)
@@ -154,14 +208,30 @@ export function Chat() {
     void (async () => {
       try {
         if (isGroup && groupId != null) {
-          setGroup(await Api.groupInfo(identity, groupId))
+          const g = await Api.groupInfo(identity, groupId)
+          _groupCache.set(groupId, g)
+          setGroup(g)
+        } else if (isSelf && peerUIN != null) {
+          // Saved Messages — synthesise the self-peer (the server never returns
+          // your own UIN in /contacts). No fetch, no "not in contacts" error.
+          setPeer({
+            uin: peerUIN,
+            nickname: t('chat.saved.title'),
+            status: 'online',
+            blocked: false,
+            identity_key: '',
+            signing_key: '',
+          })
         } else if (peerUIN != null) {
           const list = await Api.contacts(identity)
           const found = list.find((c) => c.uin === peerUIN)
           if (!found) {
-            setError(t('chat.error.peer_not_in_contacts', { uin: peerUIN }))
+            // Only surface "not in contacts" on a COLD load — if we already
+            // painted from cache, keep showing it rather than flashing an error.
+            if (!_peerCache.has(peerUIN)) setError(t('chat.error.peer_not_in_contacts', { uin: peerUIN }))
             return
           }
+          _peerCache.set(peerUIN, found)
           setPeer(found)
         }
       } catch (e) {
@@ -179,23 +249,50 @@ export function Chat() {
     void Api.myInfo(identity).then(setMyInfo).catch(() => {})
   }, [identity])
 
-  // Keep the newest message in view. On a THREAD switch jump instantly to
-  // the bottom (no animated scroll through the whole history — that was the
-  // jarring "reel everything down on open"); for a NEW message in the open
-  // thread, smooth-scroll so it slides into view. We detect a thread switch
-  // by comparing persistKey across renders.
+  // Keep the newest message in view WITHOUT ever animating through the whole
+  // history. Three cases (#17 "при заходе в группу проматывается весь огромный"):
+  //   • thread switch  → jump instantly to the bottom.
+  //   • new content while the user is AT the bottom → follow it (instant for a
+  //     long hop like a queued-history burst, smooth only for a short slide).
+  //   • new content while the user has scrolled UP to read → don't move.
+  // The earlier code smooth-scrolled on every incoming.length change, so each
+  // message that hydrated/drained after open reeled the list down.
   const lastThreadRef = useRef<string | null>(null)
+  const atBottomRef = useRef(true)
   useEffect(() => {
     const switched = lastThreadRef.current !== persistKey
     lastThreadRef.current = persistKey
     const el = scrollRef.current
     if (!el) return
-    const behavior: ScrollBehavior = switched ? 'auto' : 'smooth'
-    // Defer past layout so late content (queued history, decrypted images)
-    // is measured before we pin to the bottom — otherwise the jump lands
-    // short and the last bubbles hide under the composer.
-    requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior }))
+    // Defer past layout so late content (queued history, decrypted images) is
+    // measured before we pin to the bottom — otherwise the jump lands short
+    // and the last bubbles hide under the composer.
+    requestAnimationFrame(() => {
+      if (switched) {
+        el.scrollTo({ top: el.scrollHeight, behavior: 'auto' })
+        atBottomRef.current = true
+        return
+      }
+      if (!atBottomRef.current) return
+      const distance = el.scrollHeight - el.scrollTop - el.clientHeight
+      el.scrollTo({ top: el.scrollHeight, behavior: distance > el.clientHeight ? 'auto' : 'smooth' })
+    })
   }, [outgoing.length, incoming.length, persistKey])
+
+  // Re-pin to the bottom as the list's HEIGHT settles after open (images
+  // decrypt, the composer raises) — a one-shot scroll on open landed short, so
+  // a chat "didn't open at the last message" and you had to scroll down. While
+  // the user is at the bottom we follow growth; once they scroll up we stop.
+  useEffect(() => {
+    const el = scrollRef.current
+    const content = contentRef.current
+    if (!el || !content || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => {
+      if (atBottomRef.current) el.scrollTo({ top: el.scrollHeight })
+    })
+    ro.observe(content)
+    return () => ro.disconnect()
+  }, [persistKey])
 
   // Mark this thread as the active one: clears its unread badge on open
   // and suppresses in-app toasts for messages that land while it's open.
@@ -235,9 +332,13 @@ export function Chat() {
   /// Returns true on success.
   async function shipEnvelopeToCurrentThread(envelope: Envelope): Promise<{ ok: true } | { ok: false; error: string }> {
     if (!identity) return { ok: false, error: 'no identity' }
-    if (!REACTION_SUPPORTED_KINDS.has(envelope.kind)) {
+    if (!SHIPPABLE_KINDS.has(envelope.kind)) {
       return { ok: false, error: `unsupported envelope kind: ${envelope.kind}` }
     }
+    // Saved Messages ("Заметки") stays LOCAL — same as iOS, which skips the
+    // wire for a send to self. The optimistic row is the message; no delivery,
+    // no carbon (the row already persists to this device's localStorage log).
+    if (isSelf) return { ok: true }
     try {
       if (isGroup && group) {
         const { payloads, skipped } = encryptGroupEnvelope(envelope, identity, group.members)
@@ -300,24 +401,39 @@ export function Chat() {
   }
 
   async function attemptSendRow(row: OutgoingRow) {
-    const env: Envelope =
-      row.kind === 'photo' && row.mediaId && row.mediaKey
-        ? {
-            kind: 'photo',
-            id: row.id,
-            mediaID: row.mediaId,
-            mediaKey: row.mediaKey,
-            ...(row.text ? { caption: row.text } : {}),
-            ...(row.replyTo ? { reply: row.replyTo } : {}),
-            ...(row.fwdName ? { fwdName: row.fwdName } : {}),
-          }
-        : {
-            kind: 'text',
-            id: row.id,
-            text: row.text,
-            ...(row.replyTo ? { reply: row.replyTo } : {}),
-            ...(row.fwdName ? { fwdName: row.fwdName } : {}),
-          }
+    let env: Envelope
+    if (row.kind === 'photo' && row.mediaId && row.mediaKey) {
+      env = {
+        kind: 'photo',
+        id: row.id,
+        mediaID: row.mediaId,
+        mediaKey: row.mediaKey,
+        ...(row.text ? { caption: row.text } : {}),
+        ...(row.replyTo ? { reply: row.replyTo } : {}),
+        ...(row.fwdName ? { fwdName: row.fwdName } : {}),
+      }
+    } else if (row.kind === 'file' && row.mediaId && row.mediaKey) {
+      env = {
+        kind: 'file',
+        id: row.id,
+        mediaID: row.mediaId,
+        mediaKey: row.mediaKey,
+        fname: row.fileName ?? 'file',
+        mime: row.fileMime ?? 'application/octet-stream',
+        size: row.fileSize ?? 0,
+        ...(row.text ? { caption: row.text } : {}),
+        ...(row.replyTo ? { reply: row.replyTo } : {}),
+        ...(row.fwdName ? { fwdName: row.fwdName } : {}),
+      }
+    } else {
+      env = {
+        kind: 'text',
+        id: row.id,
+        text: row.text,
+        ...(row.replyTo ? { reply: row.replyTo } : {}),
+        ...(row.fwdName ? { fwdName: row.fwdName } : {}),
+      }
+    }
     const res = await shipEnvelopeToCurrentThread(env)
     if (res.ok) {
       setOutgoing((rows) =>
@@ -331,8 +447,46 @@ export function Chat() {
     }
   }
 
+  /// Enter edit mode for one of MY text messages: load its text into the
+  /// composer; the send button becomes "save edit".
+  function startEdit(row: OutgoingRow) {
+    setEditingRow(row)
+    setReplyTo(null)
+    setInput(row.text)
+    setActionsForRowId(null)
+    taRef.current?.focus()
+  }
+
+  function cancelEdit() {
+    setEditingRow(null)
+    setInput('')
+  }
+
+  /// Save an edit: send an `edit` envelope (kind "edit", targetID, text) to the
+  /// thread and update my local row in place. Recipients update the message
+  /// they received. No-op if unchanged/empty.
+  async function saveEdit() {
+    if (!identity || !editingRow) return
+    const trimmed = input.trim()
+    const target = editingRow
+    if (!trimmed || trimmed === target.text) {
+      cancelEdit()
+      return
+    }
+    setEditingRow(null)
+    setInput('')
+    setOutgoing((rows) => rows.map((r) => (r.id === target.id ? { ...r, text: trimmed, edited: true } : r)))
+    const env: EditEnvelope = { kind: 'edit', targetID: target.id, text: trimmed }
+    const res = await shipEnvelopeToCurrentThread(env)
+    if (!res.ok) setTransientNotice(t('chat.error.send_failed'))
+  }
+
   async function send() {
     if (!identity) return
+    if (editingRow) {
+      await saveEdit()
+      return
+    }
     const trimmed = input.trim()
     if (!trimmed) return
 
@@ -394,6 +548,43 @@ export function Chat() {
     }
   }
 
+  /// Pick → encrypt → upload → send a document of any type (#16). Raw bytes
+  /// (no canvas re-encode), sent as a `file` envelope; rendered as a download
+  /// chip on both sides. Same upload-before-row pattern as sendPhoto.
+  async function sendFile(file: File) {
+    if (!identity || uploadingFile) return
+    if (file.size > MAX_FILE_BYTES) {
+      setTransientNotice(t('chat.error.file_too_large', { mb: Math.round(MAX_FILE_BYTES / (1024 * 1024)) }))
+      return
+    }
+    setUploadingFile(true)
+    try {
+      const up = await uploadEncryptedFile(identity.apiBase, file)
+      if (!up) {
+        setTransientNotice(t('chat.error.file_upload_failed'))
+        return
+      }
+      const row: OutgoingRow = {
+        id: newUUIDv4(),
+        text: '',
+        sentAt: Date.now(),
+        state: 'sending',
+        kind: 'file',
+        mediaId: up.mediaId,
+        mediaKey: up.keyB64,
+        fileName: file.name || 'file',
+        fileMime: file.type || 'application/octet-stream',
+        fileSize: up.size,
+        ...(replyTo ? { replyTo } : {}),
+      }
+      setOutgoing((rows) => [...rows, row])
+      setReplyTo(null)
+      await attemptSendRow(row)
+    } finally {
+      setUploadingFile(false)
+    }
+  }
+
   /// User-tapped retry on a failed row. Flip back to 'sending' so the
   /// UI updates immediately, then run the same encrypt+POST path. The
   /// row keeps its original `sentAt` and UUID — only the state and
@@ -447,7 +638,7 @@ export function Chat() {
   /// Seal a reaction to the local user's own identity and deposit it to their
   /// own uin, so a reaction made here syncs to their other logged-in devices.
   async function sendReactionSelfEcho(env: ReactionEnvelope) {
-    if (!identity) return
+    if (!identity || isSelf) return // Saved Messages reactions stay local
     try {
       const selfBundle = peerBundleFrom({
         uin: identity.uin,
@@ -474,6 +665,42 @@ export function Chat() {
 
   function cancelReply() {
     setReplyTo(null)
+  }
+
+  /// Copy a message's text to the clipboard (action-menu "copy").
+  function copyText(text: string) {
+    void navigator.clipboard?.writeText(text).catch(() => {})
+    setActionsForRowId(null)
+    setTransientNotice(t('chat.copied'))
+    setTimeout(() => setTransientNotice(null), 1200)
+  }
+
+  /// Swipe-left-to-reply (touch, mobile-web "like on phones"). Returns touch
+  /// handlers for a message row; a quick leftward drag fires `onReply`.
+  function swipeReply(onReply: () => void) {
+    let startX = 0
+    let startY = 0
+    let active = false
+    return {
+      onTouchStart: (e: React.TouchEvent) => {
+        const tch = e.touches[0]
+        startX = tch.clientX
+        startY = tch.clientY
+        active = true
+      },
+      onTouchMove: (e: React.TouchEvent) => {
+        if (!active) return
+        const tch = e.touches[0]
+        // Cancel if the gesture is mostly vertical (a scroll).
+        if (Math.abs(tch.clientY - startY) > 30) active = false
+      },
+      onTouchEnd: (e: React.TouchEvent) => {
+        if (!active) return
+        active = false
+        const dx = e.changedTouches[0].clientX - startX
+        if (dx < -55) onReply()
+      },
+    }
   }
 
   /// Forward a row to another thread. Builds a fresh OutgoingRow with
@@ -556,13 +783,19 @@ export function Chat() {
 
   const headerName = isGroup
     ? group?.name ?? `#${groupId}`
-    : peer?.nickname ?? `#${peerUIN}`
+    : isSelf
+      ? t('chat.saved.title')
+      : peer?.nickname ?? `#${peerUIN}`
   const headerSub = isGroup
     ? group ? t('section.groups.members', { n: group.members.length }) : ''
-    : String(peerUIN)
+    : isSelf
+      ? t('chat.saved.subtitle')
+      : String(peerUIN)
   const headerLink = isGroup
     ? group ? `/groups/${group.id}` : '#'
-    : peer ? `/profile/${peer.uin}` : '#'
+    : isSelf
+      ? '/profile'
+      : peer ? `/profile/${peer.uin}` : '#'
 
   return (
     <div className="h-[100dvh] flex flex-col bg-surface-dim overflow-hidden">
@@ -575,7 +808,8 @@ export function Chat() {
             to={headerLink}
             className="flex items-center gap-2 flex-1 min-w-0 hover:opacity-80"
           >
-            {!isGroup && peer && <StatusIcon status={peer.status} size={20} />}
+            {!isGroup && isSelf && <BookmarkIcon />}
+            {!isGroup && !isSelf && peer && <StatusIcon status={peer.status} size={20} />}
             {isGroup && (
               <GroupAvatar
                 size={28}
@@ -591,6 +825,15 @@ export function Chat() {
         </div>
       </header>
 
+      {isGroup && group?.pinned_text && (
+        <PinnedBanner
+          text={group.pinned_text}
+          group={group}
+          expanded={pinExpanded}
+          onToggle={() => setPinExpanded((v) => !v)}
+        />
+      )}
+
       {transientNotice && (
         <div className="sticky top-14 z-10 mx-auto max-w-2xl w-full px-4 pt-2">
           <div className="rounded-md bg-ink-black/85 text-white text-xs px-3 py-2 text-center">
@@ -599,7 +842,14 @@ export function Chat() {
         </div>
       )}
 
-      <main ref={scrollRef} className="flex-1 max-w-2xl w-full mx-auto px-4 py-4 overflow-y-auto no-scrollbar">
+      <main
+        ref={scrollRef}
+        onScroll={(e) => {
+          const el = e.currentTarget
+          atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+        }}
+        className="flex-1 max-w-2xl w-full mx-auto px-4 py-4 overflow-y-auto no-scrollbar"
+      >
         {error && (
           <div className="bg-red-50 border border-red-200 rounded-md p-3 text-sm text-red-600 mb-4">
             {error}
@@ -607,7 +857,7 @@ export function Chat() {
         )}
 
 
-        <ul className="space-y-2">
+        <ul ref={contentRef} className="space-y-2">
           {[
             ...outgoing.map((row) => ({ at: row.sentAt, kind: 'out' as const, row })),
             ...incoming.map((m) => ({ at: m.at, kind: 'in' as const, msg: m })),
@@ -621,24 +871,61 @@ export function Chat() {
                   : null
                 const inviteGroupId = parseGroupInviteId(m.text)
                 const replyAuthor = senderName ?? peer?.nickname ?? `#${m.from}`
-                const isPlainText = m.kind !== 'photo' && m.kind !== 'other' && inviteGroupId == null
+                const isPlainText =
+                  m.kind !== 'photo' && m.kind !== 'video' && m.kind !== 'file' && m.kind !== 'other' && inviteGroupId == null
                 const showActions = actionsForRowId === m.id
                 const showReactionPicker = reactionForRowId === m.id
                 return (
-                  <li key={`in-${m.id}`} className="flex justify-start">
+                  <li key={`in-${m.id}`} className="flex justify-start" {...swipeReply(() => startReplyTo(m.id, m.text, replyAuthor))}>
                     <div className="max-w-[80%] flex flex-col items-start gap-1">
                       {senderName && (
-                        <div className="font-mono text-[10px] text-fg-dim px-1">{senderName}</div>
+                        <Link
+                          to={`/profile/${m.from}`}
+                          className="font-mono text-[10px] text-fg-dim px-1 hover:text-accent hover:underline"
+                        >
+                          {senderName}
+                        </Link>
                       )}
                       {m.replyTo && (
                         <div className="border-l-2 border-accent/60 pl-2 max-w-full">
                           <div className="font-mono text-[10px] text-fg-dim">{m.replyTo.authorName}</div>
-                          <div className="text-[11px] text-fg-secondary truncate max-w-[16rem]">{m.replyTo.snippet}</div>
+                          <div className="text-[11px] text-fg-secondary line-clamp-3 break-words max-w-[18rem]">{m.replyTo.snippet}</div>
                         </div>
                       )}
-                      {m.kind === 'photo' && m.mediaId && m.mediaKey ? (
+                      {m.kind === 'poll' && m.poll ? (
+                        <PollBubble poll={m.poll} />
+                      ) : m.kind === 'photo' && m.mediaId && m.mediaKey ? (
                         <div className="flex flex-col items-start gap-1">
                           <DecryptedImage mediaId={m.mediaId} mediaKey={m.mediaKey} />
+                          {m.text && (
+                            <div className="rounded-lg px-3 py-2 text-sm bg-surface-dim border border-line">
+                              <EmoticonText text={m.text} emoticonSize={18} />
+                            </div>
+                          )}
+                        </div>
+                      ) : m.kind === 'video' && m.mediaId && m.mediaKey ? (
+                        <div className="flex flex-col items-start gap-1">
+                          <DecryptedVideo
+                            mediaId={m.mediaId}
+                            mediaKey={m.mediaKey}
+                            thumbnailB64={m.thumbnailB64}
+                            durationSec={m.durationSec}
+                          />
+                          {m.text && (
+                            <div className="rounded-lg px-3 py-2 text-sm bg-surface-dim border border-line">
+                              <EmoticonText text={m.text} emoticonSize={18} />
+                            </div>
+                          )}
+                        </div>
+                      ) : m.kind === 'file' && m.mediaId && m.mediaKey ? (
+                        <div className="flex flex-col items-start gap-1">
+                          <FileBubble
+                            mediaId={m.mediaId}
+                            mediaKey={m.mediaKey}
+                            fileName={m.fileName}
+                            mime={m.fileMime}
+                            size={m.fileSize}
+                          />
                           {m.text && (
                             <div className="rounded-lg px-3 py-2 text-sm bg-surface-dim border border-line">
                               <EmoticonText text={m.text} emoticonSize={18} />
@@ -655,6 +942,7 @@ export function Chat() {
                           className="rounded-lg px-3 py-2 text-sm text-left bg-surface-dim border border-line hover:bg-line/40 transition-colors"
                         >
                           <EmoticonText text={m.text} emoticonSize={18} />
+                          {m.edited && <span className="ml-1 text-[10px] text-fg-dim italic">{t('chat.edit.edited')}</span>}
                         </button>
                       )}
                       {renderReactions(m.id, 'start')}
@@ -664,6 +952,9 @@ export function Chat() {
                       {isPlainText && showActions && (
                         <div className="flex items-center gap-1.5 rounded-lg border border-line bg-surface px-2 py-1 shadow-sm">
                           <ActionButton onClick={() => startReplyTo(m.id, m.text, replyAuthor)} label={t('chat.actions.reply')} icon="↩" />
+                          {m.kind === 'text' && (
+                            <ActionButton onClick={() => copyText(m.text)} label={t('chat.actions.copy')} icon="⧉" />
+                          )}
                           <ActionButton
                             onClick={() => setReactionForRowId((id) => (id === m.id ? null : m.id))}
                             label={t('chat.actions.react')}
@@ -748,9 +1039,77 @@ export function Chat() {
                   </li>
                 )
               }
+              if (row.kind === 'video' && row.mediaId && row.mediaKey) {
+                // A video I sent (echoed from another device via a carbon) —
+                // render the player + delivery state.
+                return (
+                  <li key={row.id} className="flex justify-end">
+                    <div className="max-w-[80%] flex flex-col items-end gap-1">
+                      <DecryptedVideo
+                        mediaId={row.mediaId}
+                        mediaKey={row.mediaKey}
+                        thumbnailB64={row.thumbnailB64}
+                        durationSec={row.durationSec}
+                      />
+                      {row.text && (
+                        <div className="rounded-lg px-3 py-2 text-sm bg-bubble-self">
+                          <EmoticonText text={row.text} emoticonSize={18} />
+                        </div>
+                      )}
+                      <div className="flex items-center justify-end gap-1 text-[10px] font-mono text-fg-dim">
+                        {new Date(row.sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        <span className="text-accent">✓</span>
+                      </div>
+                    </div>
+                  </li>
+                )
+              }
+              if (row.kind === 'file' && row.mediaId && row.mediaKey) {
+                // A document I sent — render the download chip + delivery state.
+                return (
+                  <li key={row.id} className="flex justify-end">
+                    <div className="max-w-[80%] flex flex-col items-end gap-1">
+                      <FileBubble
+                        mediaId={row.mediaId}
+                        mediaKey={row.mediaKey}
+                        fileName={row.fileName}
+                        mime={row.fileMime}
+                        size={row.fileSize}
+                      />
+                      {row.text && (
+                        <div className="rounded-lg px-3 py-2 text-sm bg-bubble-self">
+                          <EmoticonText text={row.text} emoticonSize={18} />
+                        </div>
+                      )}
+                      <div className="flex items-center justify-end gap-1 text-[10px] font-mono text-fg-dim">
+                        {new Date(row.sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        {row.state === 'sending' && <span>·{t('chat.delivery.sending')}</span>}
+                        {row.state === 'sent' && <span className="text-accent">✓</span>}
+                        {row.state === 'failed' && (
+                          <>
+                            <span className="text-red-500">·{t('chat.delivery.failed')}</span>
+                            <button
+                              onClick={() => void retry(row.id)}
+                              className="ml-1 rounded px-1.5 py-0.5 text-red-600 hover:bg-red-100 transition-colors"
+                            >
+                              ↻ {t('chat.delivery.retry')}
+                            </button>
+                            <button
+                              onClick={() => dismiss(row.id)}
+                              className="rounded px-1.5 py-0.5 text-fg-dim hover:bg-line transition-colors"
+                            >
+                              × {t('chat.delivery.dismiss')}
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  </li>
+                )
+              }
               if (row.kind === 'other') {
-                // An in-app-only media (voice/video/file/location) the user
-                // sent from another device, echoed here via a carbon.
+                // A still-unsupported media (voice/location) the user sent from
+                // another device, echoed here via a carbon.
                 return (
                   <li key={row.id} className="flex justify-end">
                     <div className="max-w-[80%] flex flex-col items-end gap-1">
@@ -766,7 +1125,7 @@ export function Chat() {
               const showActions = actionsForRowId === row.id
               const showReactionPicker = reactionForRowId === row.id
               return (
-              <li key={row.id} className="flex justify-end">
+              <li key={row.id} className="flex justify-end" {...swipeReply(() => startReply(row))}>
                 <div className="max-w-[80%] flex flex-col items-end gap-1">
                   {row.fwdName && (
                     <div className="font-mono text-[10px] uppercase tracking-wider text-fg-dim">
@@ -776,7 +1135,7 @@ export function Chat() {
                   {row.replyTo && (
                     <div className="border-l-2 border-accent/60 pl-2 max-w-full">
                       <div className="font-mono text-[10px] text-fg-dim">{row.replyTo.authorName}</div>
-                      <div className="text-[11px] text-fg-secondary truncate max-w-[16rem]">
+                      <div className="text-[11px] text-fg-secondary line-clamp-3 break-words max-w-[18rem]">
                         {row.replyTo.snippet}
                       </div>
                     </div>
@@ -790,6 +1149,7 @@ export function Chat() {
                     }`}
                   >
                     <EmoticonText text={row.text} emoticonSize={18} />
+                    {row.edited && <span className="ml-1 text-[10px] text-fg-dim italic">{t('chat.edit.edited')}</span>}
                   </button>
                   {renderReactions(row.id, 'end')}
                   <div className="flex items-center justify-end gap-1 text-[10px] font-mono text-fg-dim">
@@ -822,6 +1182,12 @@ export function Chat() {
                   {showActions && row.state === 'sent' && (
                     <div className="flex items-center gap-1.5 rounded-lg border border-line bg-surface px-2 py-1 shadow-sm">
                       <ActionButton onClick={() => startReply(row)} label={t('chat.actions.reply')} icon="↩" />
+                      {(!row.kind || row.kind === 'text') && (
+                        <ActionButton onClick={() => startEdit(row)} label={t('chat.actions.edit')} icon="✎" />
+                      )}
+                      {(!row.kind || row.kind === 'text') && (
+                        <ActionButton onClick={() => copyText(row.text)} label={t('chat.actions.copy')} icon="⧉" />
+                      )}
                       <ActionButton onClick={() => setForwardingRow(row)} label={t('chat.actions.forward')} icon="↗" />
                       <ActionButton
                         onClick={() => setReactionForRowId((id) => (id === row.id ? null : row.id))}
@@ -849,7 +1215,7 @@ export function Chat() {
           input is a bordered round pill, side buttons are round, and the
           emoji panel is a floating overlay ABOVE the composer — it does
           not push the input down or the messages up. */}
-      <div className="flex-none bg-surface-dim border-t border-line/60 pb-[env(safe-area-inset-bottom)]">
+      <div className="flex-none pb-[env(safe-area-inset-bottom)]">
         <div className="relative max-w-lg mx-auto px-3 py-3">
           {/* Floating emoji panel — absolute, sits above the composer over
               the chat, independent of layout. */}
@@ -875,7 +1241,23 @@ export function Chat() {
             </div>
           ) : (
           <div className="space-y-2">
-          {replyTo && (
+          {editingRow && (
+            <div className="flex items-start gap-2 rounded-2xl border border-accent/40 bg-accent/5 px-3 py-2 text-xs">
+              <div className="border-l-2 border-accent/60 pl-2 flex-1 min-w-0">
+                <div className="font-mono text-[10px] text-accent uppercase tracking-wider">
+                  {t('chat.edit.editing')}
+                </div>
+                <div className="text-fg-secondary truncate">{editingRow.text}</div>
+              </div>
+              <button
+                onClick={cancelEdit}
+                className="font-mono text-[10px] uppercase tracking-wider text-fg-dim hover:text-fg-primary"
+              >
+                × {t('chat.reply.cancel')}
+              </button>
+            </div>
+          )}
+          {replyTo && !editingRow && (
             <div className="flex items-start gap-2 rounded-2xl border border-line bg-surface-dim px-3 py-2 text-xs">
               <div className="border-l-2 border-accent/60 pl-2 flex-1 min-w-0">
                 <div className="font-mono text-[10px] text-fg-dim">
@@ -891,7 +1273,7 @@ export function Chat() {
               </button>
             </div>
           )}
-          <div className="flex items-center gap-2">
+          <div className="flex items-end gap-2">
             <input
               ref={fileInputRef}
               type="file"
@@ -903,19 +1285,67 @@ export function Chat() {
                 if (file) void sendPhoto(file)
               }}
             />
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              disabled={(!peer && !group) || uploadingPhoto}
-              className="h-10 w-10 rounded-full flex items-center justify-center flex-none bg-surface-dim hover:bg-line transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-              title={t('chat.attach')}
-              aria-label={t('chat.attach')}
-            >
-              {uploadingPhoto ? <span className="text-xs">…</span> : <AttachIcon />}
-            </button>
+            <input
+              ref={docInputRef}
+              type="file"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0]
+                e.target.value = '' // allow re-picking the same file
+                if (file) void sendFile(file)
+              }}
+            />
+            <div className="relative flex-none">
+              <button
+                onClick={() => setAttachMenuOpen((v) => !v)}
+                disabled={(!peer && !group) || uploadingPhoto || uploadingFile}
+                className="h-10 w-10 rounded-full flex items-center justify-center text-fg-secondary hover:bg-line/60 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                title={t('chat.attach')}
+                aria-label={t('chat.attach')}
+              >
+                {uploadingPhoto || uploadingFile ? <span className="text-xs">…</span> : <AttachIcon />}
+              </button>
+              <AnimatePresence>
+                {attachMenuOpen && (
+                  <>
+                    {/* click-away backdrop */}
+                    <div className="fixed inset-0 z-10" onClick={() => setAttachMenuOpen(false)} />
+                    <motion.div
+                      initial={{ opacity: 0, y: 6 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: 6 }}
+                      transition={{ duration: 0.14 }}
+                      className="absolute bottom-full left-0 mb-2 z-20 w-44 rounded-xl border border-line bg-surface shadow-lg overflow-hidden"
+                    >
+                      <button
+                        onClick={() => {
+                          setAttachMenuOpen(false)
+                          fileInputRef.current?.click()
+                        }}
+                        className="flex w-full items-center gap-2.5 px-3 py-2.5 text-sm hover:bg-surface-dim transition-colors"
+                      >
+                        <AttachIcon />
+                        {t('chat.attach.photo')}
+                      </button>
+                      <button
+                        onClick={() => {
+                          setAttachMenuOpen(false)
+                          docInputRef.current?.click()
+                        }}
+                        className="flex w-full items-center gap-2.5 px-3 py-2.5 text-sm hover:bg-surface-dim transition-colors border-t border-line"
+                      >
+                        <DocIcon />
+                        {t('chat.attach.file')}
+                      </button>
+                    </motion.div>
+                  </>
+                )}
+              </AnimatePresence>
+            </div>
             <button
               onClick={() => setShowPicker((v) => !v)}
               className={`h-10 w-10 rounded-full flex items-center justify-center flex-none transition-colors ${
-                showPicker ? 'bg-accent/15 ring-1 ring-accent/40' : 'bg-surface-dim hover:bg-line'
+                showPicker ? 'bg-accent/15 ring-1 ring-accent/40' : 'hover:bg-line/60'
               }`}
               title={t('chat.emoticons')}
               aria-label={t('chat.emoticons')}
@@ -930,8 +1360,9 @@ export function Chat() {
               />
             </button>
             <textarea
+              ref={taRef}
               rows={1}
-              className="flex-1 resize-none rounded-full border border-line bg-transparent px-4 py-2.5 text-sm outline-none leading-tight placeholder:text-fg-dim focus:border-accent transition-colors"
+              className="flex-1 resize-none rounded-2xl border border-line bg-surface px-4 py-2.5 text-sm outline-none leading-snug placeholder:text-fg-dim focus:border-accent transition-colors max-h-[140px] overflow-y-auto"
               placeholder={
                 isGroup && group
                   ? t('chat.placeholder.group', { name: group.name })
@@ -1006,6 +1437,25 @@ function AttachIcon() {
   )
 }
 
+/// Bookmark glyph for the Saved Messages («Заметки») chat header.
+function BookmarkIcon() {
+  return (
+    <svg className="text-accent flex-none" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z" />
+    </svg>
+  )
+}
+
+/// Document glyph for the "File" attach-menu item — a sheet with a folded corner.
+function DocIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z" />
+      <polyline points="14 3 14 9 20 9" />
+    </svg>
+  )
+}
+
 /// Placeholder bubble for an incoming media kind the web can't render
 /// yet (video/voice/file/location). Shows the kind + an "open in app"
 /// hint rather than silently dropping the message.
@@ -1020,6 +1470,167 @@ function MediaPlaceholder({ mediaKind }: { mediaKind?: string }) {
     <div className="rounded-lg px-3 py-2 bg-surface-dim border border-line">
       <div className="text-sm">{icon} {label}</div>
       <div className="text-[10px] text-fg-dim">{t('chat.media.in_app_only')}</div>
+    </div>
+  )
+}
+
+/// Group pinned announcement (#4 — web showed no pin at all). Collapsed to a
+/// single truncated line; tapping expands it into a FIXED-height scrollable box
+/// (#5 — a long pin must not push the whole chat down / become unscrollable).
+/// One-line collapsed preview: strip invite links / URLs so the pinned bar
+/// reads as clean text instead of raw `https://rcq.app/g/…` noise.
+function pinPreview(text: string): string {
+  return text
+    .replace(/(?:https?:\/\/)?(?:www\.|chat\.)?rcq\.app\/g\/\d+/gi, '')
+    .replace(/rcq:\/\/group\/\d+/gi, '')
+    .replace(/https?:\/\/\S+/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function PinnedBanner({ text, group, expanded, onToggle }: { text: string; group: RCQGroup; expanded: boolean; onToggle: () => void }) {
+  const { t } = useI18n()
+  return (
+    <div className="flex-none bg-surface-dim border-b border-line">
+      <div className="max-w-2xl mx-auto w-full">
+        <button
+          type="button"
+          onClick={onToggle}
+          className="w-full px-4 py-2 flex items-center gap-2 text-left hover:bg-line/30"
+        >
+          <PinIcon />
+          {expanded ? (
+            <div className="flex-1 min-w-0 text-[13px] font-medium text-fg-secondary">{t('chat.pin.title')}</div>
+          ) : (
+            <div className="flex-1 min-w-0 truncate text-[13px] text-fg-secondary">{pinPreview(text)}</div>
+          )}
+          <span className="text-fg-dim text-xs shrink-0">{expanded ? '▲' : '▼'}</span>
+        </button>
+        {/* Smooth expand/collapse (#pin-animate). overflow-hidden clips the
+            height tween; the inner box keeps its own scroll + bottom padding so
+            the last group card never touches the edge (#pin-card-padding). */}
+        <AnimatePresence initial={false}>
+          {expanded && (
+            <motion.div
+              key="pin-body"
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.22, ease: 'easeOut' }}
+              className="overflow-hidden"
+            >
+              <div className="px-4 pt-1 pb-3 max-h-96 overflow-y-auto text-[13px] text-fg-secondary">
+                <PinnedRichText text={text} group={group} />
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+    </div>
+  )
+}
+
+function PinIcon() {
+  return (
+    <svg className="text-fg-secondary shrink-0" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="12" y1="17" x2="12" y2="22" />
+      <path d="M5 17h14l-1.5-3V6a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v8L5 17z" />
+    </svg>
+  )
+}
+
+/// Renders the pinned announcement the way the native apps do (#pin-native):
+/// group-invite links become join CARDS, #UIN mentions become clickable nicks,
+/// plain URLs become clickable links, everything else is plain text. Whitespace
+/// preserved so multi-line pins keep their shape.
+function PinnedRichText({ text, group }: { text: string; group: RCQGroup }) {
+  const nodes: ReactNode[] = []
+  // group-invite link | generic URL | #UIN mention
+  const re = /((?:https?:\/\/)?(?:www\.|chat\.)?rcq\.app\/g\/\d+|rcq:\/\/group\/\d+)|(https?:\/\/[^\s]+)|#(\d{3,})/gi
+  let last = 0
+  let key = 0
+  let m: RegExpExecArray | null
+  const pushText = (s: string) => { if (s) nodes.push(<span key={key++}>{s}</span>) }
+  while ((m = re.exec(text)) !== null) {
+    pushText(text.slice(last, m.index))
+    last = m.index + m[0].length
+    if (m[1]) {
+      const gid = parseGroupInviteId(m[1])
+      if (gid != null) {
+        nodes.push(<div key={key++} className="my-1.5"><GroupJoinCard groupId={gid} /></div>)
+      } else {
+        pushText(m[0])
+      }
+    } else if (m[2]) {
+      nodes.push(
+        <a key={key++} href={m[2]} target="_blank" rel="noreferrer" className="text-accent hover:underline break-all">{m[2]}</a>,
+      )
+    } else if (m[3]) {
+      const uin = Number(m[3])
+      const nick = group.members.find((x) => x.uin === uin)?.nickname
+      nodes.push(
+        <Link key={key++} to={`/profile/${uin}`} className="text-accent hover:underline">{nick ?? `#${uin}`}</Link>,
+      )
+    }
+  }
+  pushText(text.slice(last))
+  return <div className="whitespace-pre-wrap break-words">{nodes}</div>
+}
+
+/// Renders a group poll inline (#7 — polls were invisible on web). The ballot
+/// comes from the envelope; live tallies + the caller's vote come from
+/// /polls/{id}. Tap an option to (un)vote.
+function PollBubble({ poll }: { poll: PollRow }) {
+  const { t } = useI18n()
+  const { identity } = useIdentity()
+  const [tally, setTally] = useState<PollOut | null>(null)
+  useEffect(() => {
+    if (!identity) return
+    let alive = true
+    void Api.loadPoll(identity, poll.pollId)
+      .then((p) => { if (alive) setTally(p) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [identity, poll.pollId])
+  const total = tally?.total_votes ?? 0
+  const myVotes = tally?.my_votes ?? []
+  const closed = tally?.closed_at != null
+  async function vote(i: number) {
+    if (closed || !identity) return
+    try { setTally(await Api.votePoll(identity, poll.pollId, i)) } catch { /* ignore */ }
+  }
+  return (
+    <div className="rounded-lg px-3 py-2 bg-surface-dim border border-line w-[18rem] max-w-full">
+      <div className="text-sm font-semibold">{poll.question}</div>
+      <div className="text-[10px] text-fg-dim mb-2">
+        {poll.single ? t('poll.single') : t('poll.multi')}
+        {poll.anon ? ` · ${t('poll.anon')}` : ''}
+      </div>
+      <div className="flex flex-col gap-1.5">
+        {poll.options.map((opt, i) => {
+          const count = tally?.tallies.find((x) => x.option_index === i)?.count ?? 0
+          const pct = total > 0 ? Math.round((count / total) * 100) : 0
+          const mine = myVotes.includes(i)
+          return (
+            <button
+              key={i}
+              type="button"
+              disabled={closed}
+              onClick={() => void vote(i)}
+              className="relative text-left rounded-md overflow-hidden border border-line px-2 py-1.5 disabled:cursor-default"
+            >
+              <div className="absolute inset-y-0 left-0 bg-accent/20" style={{ width: `${pct}%` }} />
+              <div className="relative flex items-center gap-2 text-[13px]">
+                <span className="flex-1 truncate">{mine ? '✓ ' : ''}{opt}</span>
+                <span className="text-fg-secondary tabular-nums whitespace-nowrap">{count} · {pct}%</span>
+              </div>
+            </button>
+          )
+        })}
+      </div>
+      <div className="text-[11px] text-fg-dim mt-2">
+        {t('poll.votes', { n: total })}{closed ? ` · ${t('poll.closed')}` : ''}
+      </div>
     </div>
   )
 }

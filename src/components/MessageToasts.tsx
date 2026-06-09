@@ -7,12 +7,14 @@
 // counterpart.)
 
 import { useEffect, useState } from 'react'
+import { AnimatePresence, motion } from 'framer-motion'
 import { useNavigate } from 'react-router-dom'
 import { onToast, useTotalUnread, type Toast } from '../lib/incoming-store'
 import { useIdentity } from '../lib/identity-context'
 import { useI18n } from '../lib/i18n-context'
-import { lookupContactName, lookupGroupName, lookupContactStatus } from '../pages/Contacts'
+import { lookupContactName, lookupGroupName, lookupContactStatus, lookupGroupAvatar } from '../pages/Contacts'
 import { EmoticonText } from './EmoticonText'
+import { GroupAvatar } from './GroupAvatar'
 import { StatusIcon } from './StatusIcon'
 
 interface LiveToast extends Toast {
@@ -59,7 +61,8 @@ export function MessageToasts() {
   }
 
   return (
-    <div className="fixed bottom-3 right-3 z-50 flex flex-col gap-2 w-72 max-w-[calc(100vw-1.5rem)]">
+    <div className="fixed top-16 right-3 sm:top-auto sm:bottom-3 z-50 flex flex-col gap-2 w-72 max-w-[calc(100vw-1.5rem)]">
+      <AnimatePresence initial={false}>
       {toasts.map((toast) => {
         const title =
           toast.groupId != null
@@ -68,15 +71,31 @@ export function MessageToasts() {
         const sender =
           toast.groupId != null ? lookupContactName(identity!.uin, toast.from) || `#${toast.from}` : null
         const senderStatus = lookupContactStatus(identity!.uin, toast.from)
+        const groupAvatar = toast.groupId != null ? lookupGroupAvatar(identity!.uin, toast.groupId) : null
         const body =
-          toast.kind === 'photo' ? t('toast.photo') : toast.kind === 'other' ? t('toast.attachment') : toast.text
+          toast.kind === 'photo' ? t('toast.photo')
+          : toast.kind === 'video' ? t('chat.media.kind.video')
+          : toast.kind === 'file' ? (toast.text || t('chat.media.kind.file'))
+          : toast.kind === 'other' ? t('toast.attachment')
+          : toast.text
         return (
-          <button
+          <motion.button
             key={toast.key}
+            layout
+            initial={{ opacity: 0, x: 24, scale: 0.97 }}
+            animate={{ opacity: 1, x: 0, scale: 1 }}
+            exit={{ opacity: 0, x: 24, scale: 0.97 }}
+            transition={{ duration: 0.22, ease: 'easeOut' }}
             onClick={() => open(toast)}
             className="text-left rounded-xl border border-line bg-surface shadow-lg px-3 py-2.5 hover:bg-surface-dim transition-colors"
           >
             <div className="flex items-start gap-2">
+              {/* Group toast: lead with the group's avatar (#toast-avatars). */}
+              {toast.groupId != null && (
+                <div className="flex-none mt-0.5">
+                  <GroupAvatar size={28} mediaId={groupAvatar?.mediaId} mediaKey={groupAvatar?.mediaKey} />
+                </div>
+              )}
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-1.5">
                   {toast.groupId == null && senderStatus && <StatusIcon status={senderStatus} size={12} />}
@@ -105,9 +124,10 @@ export function MessageToasts() {
                 ×
               </span>
             </div>
-          </button>
+          </motion.button>
         )
       })}
+      </AnimatePresence>
     </div>
   )
 }

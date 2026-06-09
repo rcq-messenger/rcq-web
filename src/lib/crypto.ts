@@ -110,6 +110,40 @@ export interface PhotoEnvelope {
   reply?: ReplyContext
 }
 
+/// Video. Mirrors iOS `Envelope.video`: the bytes live as an AES-256-GCM blob
+/// at `/media/{mediaID}` (decrypted with `mediaKey`), plus a base64 JPEG
+/// `thumbnailB64` poster + `durationSec`. Wire keys match the iOS CodingKeys
+/// (thumbnailB64 / durationSec). The web can't COMPOSE a video (no thumbnail/
+/// duration extraction), but it renders + plays inbound ones (#15).
+export interface VideoEnvelope {
+  kind: 'video'
+  id: string // uppercase UUID
+  mediaID: string
+  mediaKey: string // base64 AES-256 key
+  thumbnailB64: string // base64 JPEG poster frame
+  durationSec: number
+  caption?: string
+  fwdName?: string
+  reply?: ReplyContext
+}
+
+/// File / document. Mirrors iOS `Envelope.file`: the raw bytes are an
+/// AES-256-GCM blob at `/media/{mediaID}`, decrypted with `mediaKey`; the
+/// terse wire keys `fname`/`mime`/`size` carry the display name, content type,
+/// and plaintext byte length (iOS CodingKeys fileName="fname", sizeBytes="size").
+export interface FileEnvelope {
+  kind: 'file'
+  id: string // uppercase UUID
+  mediaID: string
+  mediaKey: string // base64 AES-256 key
+  fname: string // original file name
+  mime: string // content type
+  size: number // plaintext byte length
+  caption?: string
+  fwdName?: string
+  reply?: ReplyContext
+}
+
 /// Carbon (multi-device send-side sync). When the user sends a message
 /// from one device, that device also seals a `carbon` to the user's OWN
 /// identity (to_uin = me) wrapping the original envelope plus its
@@ -125,7 +159,38 @@ export interface CarbonEnvelope {
   env: Envelope // the original sent envelope (text/photo/…)
 }
 
-export type Envelope = TextEnvelope | ReactionEnvelope | PhotoEnvelope | CarbonEnvelope
+/// Group poll announcement (iOS/Android kind "poll"). Terse wire keys to
+/// match the mobile clients: `poll` = server poll id, `q` = question,
+/// `opts` = option labels, `sc` = single-choice, `anon` = anonymous. The
+/// full ballot rides encrypted here so the web renders it without needing
+/// `/polls/{id}`; live tallies + voting hit that endpoint on top.
+export interface PollEnvelope {
+  kind: 'poll'
+  id: string // uppercase UUID (the message id)
+  poll: number // server-side poll id (for /polls/{id} + /vote)
+  q: string
+  opts: string[]
+  sc: boolean
+  anon: boolean
+}
+
+/// Edit (iOS/Android kind "edit"): the author replaces the body of message
+/// `targetID` with `text`. Recipients update that message in place.
+export interface EditEnvelope {
+  kind: 'edit'
+  targetID: string
+  text: string
+}
+
+export type Envelope =
+  | TextEnvelope
+  | ReactionEnvelope
+  | PhotoEnvelope
+  | VideoEnvelope
+  | FileEnvelope
+  | CarbonEnvelope
+  | PollEnvelope
+  | EditEnvelope
 
 /// Identity material a web session needs to send v=1 envelopes.
 /// Bundled by the iOS app and shipped via the linking QR. Web reads
@@ -209,6 +274,28 @@ export function envelopeToObject(env: Envelope): Record<string, unknown> {
     if (env.caption != null) obj.caption = env.caption
     if (env.fwdName != null) obj.fwdName = env.fwdName
     if (env.reply != null) obj.reply = env.reply
+  } else if (env.kind === 'video') {
+    obj.id = env.id
+    obj.mediaID = env.mediaID
+    obj.mediaKey = env.mediaKey
+    obj.thumbnailB64 = env.thumbnailB64
+    obj.durationSec = env.durationSec
+    if (env.caption != null) obj.caption = env.caption
+    if (env.fwdName != null) obj.fwdName = env.fwdName
+    if (env.reply != null) obj.reply = env.reply
+  } else if (env.kind === 'file') {
+    obj.id = env.id
+    obj.mediaID = env.mediaID
+    obj.mediaKey = env.mediaKey
+    obj.fname = env.fname
+    obj.mime = env.mime
+    obj.size = env.size
+    if (env.caption != null) obj.caption = env.caption
+    if (env.fwdName != null) obj.fwdName = env.fwdName
+    if (env.reply != null) obj.reply = env.reply
+  } else if (env.kind === 'edit') {
+    obj.targetID = env.targetID
+    obj.text = env.text
   } else if (env.kind === 'carbon') {
     // Multi-device carbon: include only the destination that's set
     // (encodeIfPresent style, matches iOS/Android), nest the original

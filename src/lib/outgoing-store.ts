@@ -17,13 +17,18 @@ export interface OutgoingRow {
   sentAt: number
   state: 'sending' | 'sent' | 'failed'
   error?: string
-  /// Photo attachment ('photo'), or an in-app-only media kind echoed from
-  /// another device via a carbon ('other' — voice/video/file/location the
-  /// web can't compose but should still show as "you sent this elsewhere").
-  kind?: 'text' | 'photo' | 'other'
+  /// Photo / video / file attachment, or a still-unsupported media kind echoed
+  /// from another device via a carbon ('other' — voice/location the web can't
+  /// render but should still show as "you sent this elsewhere").
+  kind?: 'text' | 'photo' | 'video' | 'file' | 'other'
   mediaId?: string
   mediaKey?: string
   mediaKind?: string // for 'other': the original envelope kind
+  thumbnailB64?: string // for 'video': base64 JPEG poster
+  durationSec?: number // for 'video': length in seconds
+  fileName?: string // for 'file': original name
+  fileMime?: string // for 'file': content type
+  fileSize?: number // for 'file': plaintext byte length
   /// Snippet of the message we're replying to + author.
   replyTo?: ReplyContext
   /// Original author nickname when this row is a forward.
@@ -31,6 +36,8 @@ export interface OutgoingRow {
   /// Deprecated: the old outgoing-only reaction badge. Kept so rows persisted
   /// before the shared reactions store still parse.
   myReaction?: string
+  /// Author edited this message after sending.
+  edited?: boolean
 }
 
 /// Per-thread storage key for the outgoing log. Keys look like
@@ -118,11 +125,46 @@ function outgoingRowFromInner(inner: Envelope): OutgoingRow | null {
       ...(inner.fwdName ? { fwdName: inner.fwdName } : {}),
     }
   }
-  // An in-app-only media kind sent from another device (voice/video/file/
-  // location). The web can't compose these, but show a placeholder so the
-  // user sees that they sent something here rather than a silent gap.
+  // Video sent from another device (#15): keep the media ref + poster so the
+  // web renders + plays it as a fromMe row, not a bare placeholder.
+  if (inner.kind === 'video') {
+    return {
+      id: inner.id,
+      text: inner.caption ?? '',
+      sentAt: Date.now(),
+      state: 'sent',
+      kind: 'video',
+      mediaId: inner.mediaID,
+      mediaKey: inner.mediaKey,
+      thumbnailB64: inner.thumbnailB64,
+      durationSec: inner.durationSec,
+      ...(inner.reply ? { replyTo: inner.reply } : {}),
+      ...(inner.fwdName ? { fwdName: inner.fwdName } : {}),
+    }
+  }
+  // File / document sent from another device (#16): keep the media ref + name/
+  // mime/size for the download chip.
+  if (inner.kind === 'file') {
+    return {
+      id: inner.id,
+      text: inner.caption ?? '',
+      sentAt: Date.now(),
+      state: 'sent',
+      kind: 'file',
+      mediaId: inner.mediaID,
+      mediaKey: inner.mediaKey,
+      fileName: inner.fname,
+      fileMime: inner.mime,
+      fileSize: inner.size,
+      ...(inner.reply ? { replyTo: inner.reply } : {}),
+      ...(inner.fwdName ? { fwdName: inner.fwdName } : {}),
+    }
+  }
+  // A still-unsupported media kind sent from another device (voice/location).
+  // The web can't render these, but show a placeholder so the user sees that
+  // they sent something here rather than a silent gap.
   const loose = inner as { kind?: string; id?: string; caption?: string }
-  if (loose.id && (loose.kind === 'video' || loose.kind === 'voice' || loose.kind === 'file' || loose.kind === 'location')) {
+  if (loose.id && (loose.kind === 'voice' || loose.kind === 'location')) {
     return { id: loose.id, text: loose.caption ?? '', sentAt: Date.now(), state: 'sent', kind: 'other', mediaKind: loose.kind }
   }
   return null
