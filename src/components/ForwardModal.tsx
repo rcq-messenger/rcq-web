@@ -120,7 +120,7 @@ export function ForwardModal({
                     <StatusIcon status={c.status} size={18} />
                     <div className="flex-1 min-w-0">
                       <div className="text-sm truncate">{c.nickname}</div>
-                      <div className="font-mono text-[10px] text-fg-dim">{c.uin}</div>
+                      <div className="font-mono text-[10px] text-fg-dim">#{c.uin}</div>
                     </div>
                   </Row>
                 )

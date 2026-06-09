@@ -110,7 +110,7 @@ export function AddContact() {
             <li key={u.uin} className="p-4 flex items-center gap-3">
               <div className="flex-1 min-w-0">
                 <div className="font-medium truncate">{u.nickname || `#${u.uin}`}</div>
-                <div className="font-mono text-xs text-fg-dim">{u.uin}</div>
+                <div className="font-mono text-xs text-fg-dim">#{u.uin}</div>
                 {u.city && (
                   <div className="text-xs text-fg-dim truncate">{u.city}{u.country ? `, ${u.country}` : ''}</div>
                 )}

@@ -229,7 +229,7 @@ export function Contacts() {
                 <span className="font-semibold text-sm truncate">
                   {me.nickname || `#${me.uin}`}
                 </span>
-                <span className="font-mono text-[10px] text-fg-dim">{me.uin}</span>
+                <span className="font-mono text-[10px] text-fg-dim">#{me.uin}</span>
               </Link>
             </>
           )}
@@ -494,13 +494,17 @@ function ContactRow({
               <span className={'truncate ' + (unread > 0 ? 'font-bold' : 'font-medium')}>
                 {contact.nickname || `#${contact.uin}`}
               </span>
+              <GenderIcon gender={contact.gender} />
               {favorite && <span className="text-yellow-500 text-xs flex-none">★</span>}
               {muted && <span className="text-fg-dim text-xs flex-none">🔕</span>}
               {contact.blocked && <BlockedIcon />}
             </div>
-            {contact.status_message && (
-              <div className="text-xs text-fg-dim truncate">{contact.status_message}</div>
-            )}
+            <div className="flex items-center gap-1.5 text-xs text-fg-dim min-w-0">
+              <span className="font-mono flex-none">#{contact.uin}</span>
+              {contact.status_message && (
+                <span className="truncate">· {contact.status_message}</span>
+              )}
+            </div>
           </div>
         </Link>
         {unread > 0 && <UnreadBadge n={unread} />}
@@ -595,6 +599,14 @@ function PersonIcon() {
       <path d="M5 20c0-3.3 3.1-5.5 7-5.5s7 2.2 7 5.5" />
     </svg>
   )
+}
+/// Gender glyph next to a contact's name (iOS/Android parity). Male = blue ♂,
+/// female = pink ♀; anything else renders nothing.
+function GenderIcon({ gender }: { gender?: string | null }) {
+  const g = (gender || '').toLowerCase()
+  if (g === 'm' || g === 'male') return <span className="text-xs flex-none" style={{ color: '#4A90D9' }}>♂</span>
+  if (g === 'f' || g === 'female') return <span className="text-xs flex-none" style={{ color: '#D96BA6' }}>♀</span>
+  return null
 }
 /// Blocked marker — a red crossed circle (⊘), replaces the old "BLOCKED"
 /// text tag.

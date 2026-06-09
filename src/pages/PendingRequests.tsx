@@ -104,7 +104,7 @@ export function PendingRequests() {
                   <div className="font-medium truncate">
                     {r.nickname || `#${r.from_uin}`}
                   </div>
-                  <div className="font-mono text-xs text-fg-dim">{r.from_uin}</div>
+                  <div className="font-mono text-xs text-fg-dim">#{r.from_uin}</div>
                 </div>
                 <div className="flex items-center gap-2">
                   <button

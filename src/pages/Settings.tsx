@@ -83,7 +83,7 @@ export function Settings() {
           </div>
           <div className="flex items-center justify-between text-sm">
             <span className="text-fg-secondary">{t('settings.field.uin')}</span>
-            <span className="font-mono">{identity.uin}</span>
+            <span className="font-mono">#{identity.uin}</span>
           </div>
         </section>
 

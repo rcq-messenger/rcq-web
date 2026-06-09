@@ -161,7 +161,7 @@ function ReadView({
           <StatusIcon status={info.status} size={22} />
           <div className="text-2xl font-bold">{info.nickname || `#${info.uin}`}</div>
         </div>
-        <div className="font-mono text-xs text-fg-dim">{info.uin}</div>
+        <div className="font-mono text-xs text-fg-dim">#{info.uin}</div>
         {info.status_message && (
           <div className="text-sm text-fg-secondary pt-1">{info.status_message}</div>
         )}

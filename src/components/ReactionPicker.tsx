@@ -1,10 +1,13 @@
-// Six-asset reaction picker — KOLOBOK GIFs served from /emoticons/.
-// Same six the iOS `MessageActionSheet` uses (smile, biggrin, shok,
-// cray, good, heart). Tap one to fire the parent's `onPick(asset)`;
-// tap the "✕" tile to clear an existing reaction. Compact strip,
-// fits under a chat bubble.
+// Reaction picker — KOLOBOK "set 14" GIFs served from /emoticons/. Same 12 the
+// iOS/Android clients offer (MessageActionSheet.reactionAssets / Emoticon.kt
+// `reactions`), in the same order, so a reaction renders identically on every
+// client. Tap one to fire the parent's `onPick(asset)`; tap the current one
+// again to clear it. Two rows of six under a chat bubble.
 
-const ASSETS = ['smile', 'biggrin', 'shok', 'cray', 'good', 'heart'] as const
+const ASSETS = [
+  'good', 'give_heart', 'biggrin', 'rofl', 'shok', 'cray',
+  'mad', 'diablo', 'cool', 'kiss', 'give_rose', 'man_in_love',
+] as const
 
 export type ReactionAsset = (typeof ASSETS)[number]
 
@@ -18,7 +21,7 @@ export function ReactionPicker({
   onPick: (asset: string | null) => void
 }) {
   return (
-    <div className="flex items-center gap-1 rounded-lg border border-line bg-surface px-2 py-1.5 shadow-sm">
+    <div className="grid grid-cols-6 gap-1 rounded-lg border border-line bg-surface px-2 py-1.5 shadow-sm">
       {ASSETS.map((a) => {
         const selected = current === a
         return (

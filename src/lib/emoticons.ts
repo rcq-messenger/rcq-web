@@ -33,35 +33,23 @@ export interface PackPalette {
   items: PaletteEntry[]
 }
 
+// KOLOBOK "set 14" — the SAME 40-emoticon set the iOS + Android clients ship
+// (asset names match `Emoticons.swift` / `Emoticon.kt` exactly), so a smiley
+// picked on any client renders identically everywhere. Only the `:asset:` code
+// is parsed (iOS/Android deliberately ignore typed shortcuts like `:-)` to
+// avoid colliding with URLs/math), so each code list is empty and the `:asset:`
+// form is appended by ENTRIES below. GIFs live in `public/emoticons/`.
 const RAW: Array<[string, string, string[]]> = [
-  ['smile',      'Happy',          [':-)', ':)', '=)', ':smile:']],
-  ['sad',        'Sad',            [':-(', ':(']],
-  ['wink',       'Winking',        [';-)', ';)']],
-  ['blum',       'Tongue',         [':-P', ':P', ':-p', ':p']],
-  ['tease',      'Joking',         ['*JOKINGLY*']],
-  ['cray',       'Crying',         [":'(", ":'((", ':((']],
-  ['air_kiss',   'Kissed',         ['*KISSED*']],
-  ['kiss2',      'Kiss',           [':-*', ':*']],
-  ['blush',      'Embarrassed',    [':-[', ':[']],
-  ['angel',      'Angel',          ['O:-)', 'O:)']],
-  ['secret',     'Silent',         [':-X', ':X']],
-  ['wacko',      'Confused',       [':-$', ':$']],
-  ['aggressive', 'Angry',          ['>:o', '>:O']],
-  ['biggrin',    'Laughing',       [':-D', ':D', ':))', ':-))']],
-  ['nea',        'Pensive',        [':-\\', ':\\', ':/', ':-/']],
-  ['shok',       'Shocked',        [':-O', ':O', ':-o', ':o', ':-0', ':0', '=-O']],
-  ['dirol',      'Cool',           ['8-)', '8)', 'B-)', 'B)']],
-  ['dance',      'Headphones',     ['[:-}', '[:-)', '[:}', '[:)']],
-  ['boredom',    'Yawning',        ['*TIRED*']],
-  ['bad',        'Sick',           [':-!', ':!']],
-  ['stop',       'Stop',           ['*STOP*']],
-  ['kissing',    'Two Kissing',    ['*KISSING*', ':**:']],
-  ['diablo',     'Devil',          [']:->', ']:>', '>:)', '>:-)', '}:->']],
-  ['give_rose',  'Red Rose',       ['@}->--', '@>->--', '@>->-', '@}->-', '@}-:--']],
-  ['bomb',       'Bomb',           ['@=']],
-  ['good',       'Thumbs Up',      ['*THUMBS UP*']],
-  ['drinks',     'Drink',          ['*DRINK*']],
-  ['heart',      'In Love',        ['*IN LOVE*', '<3']],
+  ['smile', 'Happy', []], ['biggrin', 'Laughing', []], ['lol', 'LOL', []], ['rofl', 'ROFL', []],
+  ['good', 'Thumbs Up', []], ['give_heart', 'Heart', []], ['man_in_love', 'In Love', []], ['give_rose', 'Rose', []],
+  ['kiss', 'Kiss', []], ['kiss3', 'Smooch', []], ['air_kiss', 'Air Kiss', []], ['blush', 'Embarrassed', []],
+  ['i_am_so_happy', 'So Happy', []], ['dance', 'Dancing', []], ['music', 'Music', []], ['cool', 'Cool', []],
+  ['gamer', 'Gamer', []], ['drinks', 'Cheers', []], ['hi', 'Hi', []], ['bye2', 'Bye', []],
+  ['blum1', 'Tongue', []], ['mocking', 'Teasing', []], ['crazy', 'Crazy', []], ['wacko1', 'Wacko', []],
+  ['nea', 'Pensive', []], ['scratch_one-s_head', 'Thinking', []], ['unknown', 'Dunno', []], ['shok', 'Shocked', []],
+  ['sad', 'Sad', []], ['cray', 'Crying', []], ['pardon', 'Pardon', []], ['sorry', 'Sorry', []],
+  ['mad', 'Angry', []], ['ireful', 'Furious', []], ['shout', 'Shouting', []], ['bad', 'Sick', []],
+  ['diablo', 'Devil', []], ['bomb', 'Bomb', []], ['girl_angel', 'Angel', []], ['hang1', 'Hang', []],
 ]
 
 interface PackManifest {
